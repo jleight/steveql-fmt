@@ -1,0 +1,16 @@
+[package]
+name = "steveql-fmt"
+version = "0.1.0"
+edition = "2021"
+description = "An opinionated SQL formatter for the objectively-best SQL format."
+
+[[bin]]
+name = "steveql-fmt"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+serde_json = "1.0.150"
+sqlparser = "0.62.0"

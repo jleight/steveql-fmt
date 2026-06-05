@@ -1,0 +1,38 @@
+[tools]
+rust = "latest"
+
+[tasks.build]
+description = "Compile the project (cargo build)"
+run = "cargo build"
+
+[tasks.run]
+description = "Run the formatter (cargo run -- <args>)"
+run = "cargo run --"
+
+[tasks.format]
+description = "Format Rust source (cargo fmt)"
+run = "cargo fmt"
+
+[tasks.test]
+description = "Run the test suite (cargo test)"
+run = "cargo test"
+
+[tasks.check]
+description = "Type-check without building artifacts (cargo check)"
+run = "cargo check"
+
+[tasks.clippy]
+description = "Lint with clippy, denying warnings"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.lint]
+description = "Format then lint"
+depends = ["format", "clippy"]
+
+[tasks.examples]
+description = "Reformat the example SQL files in place"
+run = "cargo run -- --write examples/*.sql"
+
+[tasks.lsp]
+description = "Run the formatting language server over stdio"
+run = "cargo run -- lsp"
