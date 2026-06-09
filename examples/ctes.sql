@@ -19,4 +19,16 @@ SELECT   d.id
         ,c.n
 FROM        descendants d
 LEFT JOIN   counts      c   ON  c.parent_id = d.id
-ORDER BY 1
+ORDER BY 1;
+
+WITH stale AS (
+        SELECT  id
+        FROM    products
+        WHERE   last_seen_at < NOW() - INTERVAL '90 days'
+        LIMIT   1000
+    )
+UPDATE  products    p
+SET      status     = 'archived'
+        ,updated_at = NOW()
+FROM    stale       s
+WHERE   p.id = s.id;

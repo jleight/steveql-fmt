@@ -159,6 +159,13 @@ impl Fmt {
                 out.extend(self.set_expr(right, ci));
                 out
             }
+            // A CTE in front of a DML statement (`WITH ... UPDATE/INSERT/...`)
+            // parses as a Query whose body is the wrapped statement; lay it out
+            // by hand rather than collapsing it to one inline line.
+            SetExpr::Insert(Statement::Insert(i)) => self.insert(i, ci),
+            SetExpr::Update(Statement::Update(u)) => self.update(u, ci),
+            SetExpr::Delete(Statement::Delete(d)) => self.delete(d, ci),
+            SetExpr::Merge(Statement::Merge(m)) => self.merge(m, ci),
             other => vec![format!("{}{}", pad(ci), self.post(&other.to_string()))],
         }
     }
@@ -510,17 +517,7 @@ impl Fmt {
         // Collect (keyword, relation, on, span) descriptors first so the
         // keyword column can be fixed before rendering any derived-table body.
         let mut descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)> = Vec::new();
-        for (ti, twj) in tables.iter().enumerate() {
-            let kw = if ti == 0 { "FROM" } else { "," }.to_string();
-            let s = twj.relation.span();
-            descs.push((kw, &twj.relation, None, s.start.line, s.end.line));
-            for join in &twj.joins {
-                let (kw, on) = self.join_parts(join);
-                let s = join.span();
-                descs.push((kw, &join.relation, on, s.start.line, s.end.line));
-            }
-        }
-
+        self.push_relation_descs("FROM", tables, &mut descs);
         self.render_rows(descs, ci)
     }
 
@@ -533,6 +530,23 @@ impl Fmt {
         descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)>,
         ci: usize,
     ) -> Vec<String> {
+        let (rows, cols) = self.layout_rows(descs, ci);
+        let mut out = Vec::new();
+        for row in &rows {
+            self.emit_row(row, &cols, ci, &mut out);
+        }
+        out
+    }
+
+    /// Build the relation rows and resolve the shared grid columns (table,
+    /// alias, `ON`, condition) for a relation group, without emitting anything.
+    /// Splitting layout from emission lets a caller (e.g. UPDATE ... FROM)
+    /// interleave other clauses between rows while keeping the aliases aligned.
+    fn layout_rows(
+        &self,
+        descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)>,
+        ci: usize,
+    ) -> (Vec<Row>, RowCols) {
         let kw_max = descs.iter().map(|d| d.0.chars().count()).max().unwrap_or(0);
         let table_col = align_after(ci + kw_max.saturating_sub(1));
 
@@ -560,61 +574,70 @@ impl Fmt {
         let on_col = align_after(alias_last);
         let cond_col = align_after(on_col + 1); // "ON" is 2 chars
 
-        let mut out = Vec::new();
-        for row in &rows {
-            self.flush_before(row.start_line, ci, &mut out);
+        (
+            rows,
+            RowCols {
+                table_col,
+                alias_col,
+                on_col,
+                cond_col,
+            },
+        )
+    }
 
-            // Emit everything up to and including the line that carries the
-            // alias (the table name, or a derived table's closing paren).
-            let mut last = match &row.body {
-                None => {
-                    let mut l = format!("{}{}", pad(ci), row.kw);
-                    pad_to(&mut l, table_col);
-                    l.push_str(&row.table);
-                    l
-                }
-                Some(body) => {
-                    // Derived table: the keyword sits alone, the parenthesized
-                    // body drops to the next line at this indent (not the table
-                    // column), and the closing paren carries the alias / ON.
-                    out.push(format!("{}{}", pad(ci), row.kw));
-                    out.push(format!("{}(", pad(ci)));
-                    out.extend(body.iter().cloned());
-                    format!("{})", pad(ci))
-                }
-            };
+    /// Emit a single relation row on the shared grid resolved by `layout_rows`.
+    fn emit_row(&self, row: &Row, cols: &RowCols, ci: usize, out: &mut Vec<String>) {
+        self.flush_before(row.start_line, ci, out);
 
-            if let Some(alias) = &row.alias {
-                pad_to(&mut last, alias_col);
-                last.push_str(alias);
+        // Emit everything up to and including the line that carries the
+        // alias (the table name, or a derived table's closing paren).
+        let mut last = match &row.body {
+            None => {
+                let mut l = format!("{}{}", pad(ci), row.kw);
+                pad_to(&mut l, cols.table_col);
+                l.push_str(&row.table);
+                l
             }
-
-            match &row.on {
-                None => out.push(last),
-                Some(OnClause::Using(s)) => {
-                    pad_to(&mut last, on_col);
-                    last.push_str(s);
-                    out.push(last);
-                }
-                Some(OnClause::On(expr)) => {
-                    let (ops, operands) = bool_chain(expr);
-                    pad_to(&mut last, on_col);
-                    last.push_str("ON");
-                    pad_to(&mut last, cond_col);
-                    last.push_str(&self.inline(operands[0]));
-                    out.push(last);
-                    for (op, operand) in ops.iter().zip(operands.iter().skip(1)) {
-                        let mut l = pad(on_col);
-                        l.push_str(op);
-                        pad_to(&mut l, cond_col);
-                        l.push_str(&self.inline(operand));
-                        out.push(l);
-                    }
-                }
+            Some(body) => {
+                // Derived table: the keyword sits alone, the parenthesized
+                // body drops to the next line at this indent (not the table
+                // column), and the closing paren carries the alias / ON.
+                out.push(format!("{}{}", pad(ci), row.kw));
+                out.push(format!("{}(", pad(ci)));
+                out.extend(body.iter().cloned());
+                format!("{})", pad(ci))
             }
-            self.attach_trailing(row.end_line, &mut out);
+        };
+
+        if let Some(alias) = &row.alias {
+            pad_to(&mut last, cols.alias_col);
+            last.push_str(alias);
         }
-        out
+
+        match &row.on {
+            None => out.push(last),
+            Some(OnClause::Using(s)) => {
+                pad_to(&mut last, cols.on_col);
+                last.push_str(s);
+                out.push(last);
+            }
+            Some(OnClause::On(expr)) => {
+                let (ops, operands) = bool_chain(expr);
+                pad_to(&mut last, cols.on_col);
+                last.push_str("ON");
+                pad_to(&mut last, cols.cond_col);
+                last.push_str(&self.inline(operands[0]));
+                out.push(last);
+                for (op, operand) in ops.iter().zip(operands.iter().skip(1)) {
+                    let mut l = pad(cols.on_col);
+                    l.push_str(op);
+                    pad_to(&mut l, cols.cond_col);
+                    l.push_str(&self.inline(operand));
+                    out.push(l);
+                }
+            }
+        }
+        self.attach_trailing(row.end_line, out);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -837,6 +860,8 @@ impl Fmt {
 
     fn limit(&self, lc: &sqlparser::ast::LimitClause, ci: usize) -> Vec<String> {
         use sqlparser::ast::LimitClause;
+        // The value aligns to the clause grid, lining up with SELECT/FROM/WHERE.
+        let grid = align_after(ci + "LIMIT".len() - 1);
         let mut out = Vec::new();
         match lc {
             LimitClause::LimitOffset {
@@ -845,7 +870,10 @@ impl Fmt {
                 limit_by: _,
             } => {
                 if let Some(l) = limit {
-                    out.push(format!("{}LIMIT {}", pad(ci), self.inline(l)));
+                    let mut line = format!("{}LIMIT", pad(ci));
+                    pad_to(&mut line, grid);
+                    line.push_str(&self.inline(l));
+                    out.push(line);
                 }
                 if let Some(o) = offset {
                     // `Offset`'s Display already includes the OFFSET keyword.
@@ -853,12 +881,10 @@ impl Fmt {
                 }
             }
             LimitClause::OffsetCommaLimit { offset, limit } => {
-                out.push(format!(
-                    "{}LIMIT {}, {}",
-                    pad(ci),
-                    self.inline(offset),
-                    self.inline(limit)
-                ));
+                let mut line = format!("{}LIMIT", pad(ci));
+                pad_to(&mut line, grid);
+                line.push_str(&format!("{}, {}", self.inline(offset), self.inline(limit)));
+                out.push(line);
             }
         }
         out
@@ -890,21 +916,6 @@ impl Fmt {
             out.extend(self.merge_clause(clause, ci));
         }
         out
-    }
-
-    /// A relation rendered on one line: name plus optional alias (no `AS`).
-    fn table_inline(&self, tf: &TableFactor) -> String {
-        match tf {
-            TableFactor::Table { name, alias, .. } => {
-                let mut s = self.post(&name.to_string());
-                if let Some(a) = alias {
-                    s.push(' ');
-                    s.push_str(&a.name.to_string());
-                }
-                s
-            }
-            other => self.post(&other.to_string()),
-        }
     }
 
     fn merge_clause(&self, clause: &MergeClause, ci: usize) -> Vec<String> {
@@ -1067,18 +1078,64 @@ impl Fmt {
     }
 
     fn update(&self, u: &Update, ci: usize) -> Vec<String> {
+        use sqlparser::ast::UpdateTableFromKind;
+
+        // The target table and any `FROM` tables form one aligned relation
+        // group (like MERGE's INTO/USING), so their aliases share a column.
+        // `SET` is then threaded between the target row and the `FROM` rows.
+        let (from_tables, before_set) = match &u.from {
+            Some(UpdateTableFromKind::BeforeSet(t)) => (t.as_slice(), true),
+            Some(UpdateTableFromKind::AfterSet(t)) => (t.as_slice(), false),
+            None => ([].as_slice(), false),
+        };
+
+        let mut descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)> = Vec::new();
+        self.push_relation_descs("UPDATE", std::slice::from_ref(&u.table), &mut descs);
+        self.push_relation_descs("FROM", from_tables, &mut descs);
+
+        let (rows, cols) = self.layout_rows(descs, ci);
+
         let mut out = Vec::new();
-        // `UPDATE <table>` with the table at its clause column, then `SET`
-        // leading the assignment list on the next line.
-        let mut head = format!("{}UPDATE", pad(ci));
-        pad_to(&mut head, align_after(ci + 5));
-        head.push_str(&self.table_inline(&u.table.relation));
-        out.push(head);
+        self.emit_row(&rows[0], &cols, ci, &mut out);
+        let from_rows = &rows[1..];
+        // A `FROM` before `SET` (Snowflake) precedes the assignments; the
+        // standard placement is after.
+        if before_set {
+            for row in from_rows {
+                self.emit_row(row, &cols, ci, &mut out);
+            }
+        }
         self.assignment_list(&u.assignments, "SET", ci, ci + 8, &mut out);
+        if !before_set {
+            for row in from_rows {
+                self.emit_row(row, &cols, ci, &mut out);
+            }
+        }
         if let Some(sel) = &u.selection {
             out.extend(self.river("WHERE", sel, ci));
         }
         out
+    }
+
+    /// Append relation-row descriptors for a `&[TableWithJoins]` to `descs`,
+    /// using `lead` as the first row's keyword (subsequent base tables use `,`,
+    /// joins their join keyword).
+    fn push_relation_descs<'a>(
+        &self,
+        lead: &str,
+        tables: &'a [TableWithJoins],
+        descs: &mut Vec<(String, &'a TableFactor, Option<OnClause>, u64, u64)>,
+    ) {
+        for (ti, twj) in tables.iter().enumerate() {
+            let kw = if ti == 0 { lead } else { "," }.to_string();
+            let s = twj.relation.span();
+            descs.push((kw, &twj.relation, None, s.start.line, s.end.line));
+            for join in &twj.joins {
+                let (kw, on) = self.join_parts(join);
+                let s = join.span();
+                descs.push((kw, &join.relation, on, s.start.line, s.end.line));
+            }
+        }
     }
 
     fn delete(&self, d: &Delete, ci: usize) -> Vec<String> {
@@ -1149,6 +1206,14 @@ enum Block<'e> {
     Exists(&'e Query, bool),
     Window(&'e sqlparser::ast::Function),
     Case(&'e Expr),
+}
+
+/// The shared grid columns resolved for a relation group.
+struct RowCols {
+    table_col: usize,
+    alias_col: usize,
+    on_col: usize,
+    cond_col: usize,
 }
 
 struct Row {
