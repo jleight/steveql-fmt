@@ -12,7 +12,7 @@ use sqlparser::ast::{
     GroupByExpr, Insert, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause,
     MergeClauseKind, MergeInsertKind, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
     SetExpr, SetOperator, SetQuantifier, Spanned, Statement, TableFactor, TableObject,
-    TableWithJoins, Update, WindowType,
+    TableWithJoins, Update, Values, WindowType,
 };
 use std::cell::Cell;
 
@@ -924,12 +924,7 @@ impl Fmt {
                         match &ins.kind {
                             MergeInsertKind::Row => out.push(format!("{}ROW", pad(action))),
                             MergeInsertKind::Values(v) => {
-                                out.push(format!("{}VALUES", pad(action)));
-                                for row in &v.rows {
-                                    let vals: Vec<String> =
-                                        row.content.iter().map(|e| self.inline(e)).collect();
-                                    self.leading_comma_block(&vals, body, &mut out);
-                                }
+                                self.values_rows(v, action, body, &mut out)
                             }
                         }
                     }
@@ -996,6 +991,17 @@ impl Fmt {
 
     // ---------- INSERT / UPDATE / DELETE ----------
 
+    /// Render a `VALUES` keyword at `kw_ci` followed by each row as a hugging
+    /// leading-comma block at `body`. Shared by INSERT and MERGE's INSERT
+    /// action, which lay out value rows identically.
+    fn values_rows(&self, v: &Values, kw_ci: usize, body: usize, out: &mut Vec<String>) {
+        out.push(format!("{}VALUES", pad(kw_ci)));
+        for row in &v.rows {
+            let vals: Vec<String> = row.content.iter().map(|e| self.inline(e)).collect();
+            self.leading_comma_block(&vals, body, out);
+        }
+    }
+
     fn insert(&self, ins: &Insert, ci: usize) -> Vec<String> {
         let mut out = Vec::new();
         let kw = if ins.replace_into {
@@ -1027,11 +1033,7 @@ impl Fmt {
 
         if let Some(src) = &ins.source {
             if let SetExpr::Values(v) = src.body.as_ref() {
-                out.push(format!("{}VALUES", pad(ci)));
-                for row in &v.rows {
-                    let vals: Vec<String> = row.content.iter().map(|e| self.inline(e)).collect();
-                    self.leading_comma_block(&vals, body, &mut out);
-                }
+                self.values_rows(v, ci, body, &mut out);
             } else {
                 // INSERT ... SELECT
                 out.extend(self.query(src, ci));
