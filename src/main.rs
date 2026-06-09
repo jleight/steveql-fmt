@@ -5,6 +5,7 @@
 mod format;
 mod funcs;
 mod lsp;
+mod scan;
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -14,8 +15,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use format::Comment;
-
-const SENTINEL_PREFIX: &str = "$sqlfmtph";
+use scan::{scan_not_equals, split_statements, swap_placeholders};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -191,69 +191,6 @@ fn format_statement(chunk: &str) -> (String, Option<String>) {
     }
 }
 
-/// Split SQL into statement chunks on top-level semicolons, returning each
-/// chunk's text and whether it was terminated by a `;`. Semicolons inside
-/// strings, comments, or brackets are ignored.
-fn split_statements(src: &str) -> Vec<(String, bool)> {
-    let chars: Vec<char> = src.chars().collect();
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    let mut depth: i32 = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\'' {
-                    if chars.get(i + 1) == Some(&'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        match c {
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            ';' if depth <= 0 => {
-                chunks.push((chars[start..i].iter().collect(), true));
-                i += 1;
-                start = i;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    if start < chars.len() {
-        let tail: String = chars[start..].iter().collect();
-        if !tail.trim().is_empty() {
-            chunks.push((tail, false));
-        }
-    }
-    chunks
-}
-
 /// Collect comments from the source with their line numbers, flagging those
 /// that trail code on the same line. sqlparser drops comments from its AST, so
 /// the formatter re-attaches these by source position.
@@ -286,148 +223,6 @@ fn collect_comments(src: &str) -> Vec<Comment> {
         }
     }
     comments
-}
-
-/// Scan the source for not-equal operators (outside strings and comments) in
-/// order, recording each spelling (true = `!=`, false = `<>`).
-fn scan_not_equals(src: &str) -> Vec<bool> {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '\'' {
-            i += 1;
-            while i < chars.len() {
-                if chars[i] == '\'' {
-                    if chars.get(i + 1) == Some(&'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        if c == '!' && chars.get(i + 1) == Some(&'=') {
-            out.push(true);
-            i += 2;
-            continue;
-        }
-        if c == '<' && chars.get(i + 1) == Some(&'>') {
-            out.push(false);
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    out
-}
-
-/// Replace psycopg-style placeholders (`%s`, `%(name)s`) with sqlparser-safe
-/// `$`-placeholders, returning the rewritten SQL and the originals (indexed by
-/// sentinel number). String literals and comments are left untouched.
-fn swap_placeholders(src: &str) -> (String, Vec<String>) {
-    let chars: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
-    let mut originals = Vec::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let c = chars[i];
-
-        // String literal.
-        if c == '\'' {
-            out.push(c);
-            i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '\'' {
-                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                        out.push(chars[i + 1]);
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-
-        // Line comment.
-        if c == '-' && chars.get(i + 1) == Some(&'-') {
-            while i < chars.len() && chars[i] != '\n' {
-                out.push(chars[i]);
-                i += 1;
-            }
-            continue;
-        }
-
-        // Block comment.
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            out.push(c);
-            out.push('*');
-            i += 2;
-            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
-                out.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                out.push('*');
-                out.push('/');
-                i += 2;
-            }
-            continue;
-        }
-
-        // Placeholder: % followed by a letter or '('.
-        if c == '%' {
-            let next = chars.get(i + 1).copied();
-            if matches!(next, Some(n) if n.is_ascii_alphabetic() || n == '(') {
-                let start = i;
-                i += 1;
-                if chars[i] == '(' {
-                    while i < chars.len() && chars[i] != ')' {
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        i += 1; // consume ')'
-                    }
-                }
-                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                    i += 1;
-                }
-                let original: String = chars[start..i].iter().collect();
-                let idx = originals.len();
-                originals.push(original);
-                out.push_str(&format!("{SENTINEL_PREFIX}{idx}"));
-                continue;
-            }
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    (out, originals)
 }
 
 fn print_help() {
