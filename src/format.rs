@@ -204,7 +204,14 @@ impl Fmt {
 
         let n = s.projection.len();
         let multi = n > 1;
-        let grid = align_after(ci + kw.chars().count() - 1);
+        // Items normally align after the keyword. A long keyword (any DISTINCT
+        // variant) would push them far to the right, so instead it sits alone
+        // on its line and the items drop to the standard SELECT grid — keeping
+        // them aligned with the FROM / WHERE / GROUP BY below.
+        let base_grid = align_after(ci + "SELECT".len() - 1);
+        let kw_grid = align_after(ci + kw.chars().count() - 1);
+        let wrap = kw_grid > base_grid;
+        let grid = if wrap { base_grid } else { kw_grid };
         let comma_col = grid;
         let content_col = if multi { grid + 1 } else { grid };
         let river = grid; // close-paren column for block items
@@ -231,15 +238,27 @@ impl Fmt {
         };
 
         let mut out = Vec::new();
+        if wrap {
+            // The keyword heads its own line; any header comment stays above it.
+            if let Some(first) = s.projection.first() {
+                self.flush_before(first.span().start.line, ci, &mut out);
+            }
+            out.push(format!("{}{}", pad(ci), kw));
+        }
         for (i, item) in s.projection.iter().enumerate() {
             // A comment before the first item is a header at the clause indent;
             // comments between items align with the leading commas.
             let comment_col = if i == 0 { ci } else { comma_col };
             self.flush_before(item.span().start.line, comment_col, &mut out);
             let mut line = if i == 0 {
-                let mut l = format!("{}{}", pad(ci), kw);
-                pad_to(&mut l, content_col);
-                l
+                if wrap {
+                    // Keyword already emitted; the first item drops below it.
+                    pad(content_col)
+                } else {
+                    let mut l = format!("{}{}", pad(ci), kw);
+                    pad_to(&mut l, content_col);
+                    l
+                }
             } else {
                 let mut l = pad(comma_col);
                 l.push(','); // now at content_col
@@ -780,24 +799,10 @@ impl Fmt {
         if inline {
             return vec![format!("{}{} {}", pad(ci), kw, items.join(", "))];
         }
-        // Multi-line: content one space past the keyword, leading commas.
+        // Multi-line: the comma sits tight after the keyword, content one space
+        // past it (unlike the grid-aligned SELECT-list / window variant).
         let comma_col = ci + kw.len();
-        let content_col = comma_col + 1;
-        let mut out = Vec::new();
-        for (i, item) in items.iter().enumerate() {
-            if i == 0 {
-                let mut l = format!("{}{}", pad(ci), kw);
-                pad_to(&mut l, content_col);
-                l.push_str(item);
-                out.push(l);
-            } else {
-                let mut l = pad(comma_col);
-                l.push(',');
-                l.push_str(item);
-                out.push(l);
-            }
-        }
-        out
+        comma_rows(kw, items, ci, comma_col, comma_col + 1)
     }
 
     fn order_item(&self, o: &OrderByExpr) -> String {
@@ -1280,11 +1285,18 @@ fn is_ordinal(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
-/// A leading-comma list with the keyword and items sharing a grid column.
-fn comma_list(kw: &str, items: &[String], ci: usize, grid: usize) -> Vec<String> {
-    let multi = items.len() > 1;
-    let comma_col = grid;
-    let content_col = if multi { grid + 1 } else { grid };
+/// Emit a leading-comma list: `kw` heads the first line with its first item at
+/// `content_col`, and every later item sits under a leading comma at
+/// `comma_col`. The two columns are the only thing that varies between the
+/// grid-aligned variant ([`comma_list`], SELECT list) and the keyword-tight
+/// variant ([`Fmt::kw_list`], GROUP BY / ORDER BY).
+fn comma_rows(
+    kw: &str,
+    items: &[String],
+    ci: usize,
+    comma_col: usize,
+    content_col: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if i == 0 {
@@ -1300,6 +1312,13 @@ fn comma_list(kw: &str, items: &[String], ci: usize, grid: usize) -> Vec<String>
         }
     }
     out
+}
+
+/// A leading-comma list with the keyword and items sharing a `grid` column;
+/// multiple items push the content one tabstop past the comma.
+fn comma_list(kw: &str, items: &[String], ci: usize, grid: usize) -> Vec<String> {
+    let content_col = if items.len() > 1 { grid + 1 } else { grid };
+    comma_rows(kw, items, ci, grid, content_col)
 }
 
 /// Flatten the top-level AND/OR chain. Returns (operators, operands) where
