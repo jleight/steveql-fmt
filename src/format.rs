@@ -212,7 +212,7 @@ impl Fmt {
         // AS-alignment columns across every aliased item (inline and block).
         // AS snaps to the tabstop past the widest value, and the alias name to
         // the tabstop past AS.
-        let (as_col, alias_col) = {
+        let alias_cols = {
             let mut max_end = 0usize;
             let mut any = false;
             for item in &s.projection {
@@ -221,12 +221,13 @@ impl Fmt {
                     max_end = max_end.max(self.value_end(expr, content_col));
                 }
             }
-            if any {
+            any.then(|| {
                 let as_col = align_after(max_end);
-                (Some(as_col), Some(align_after(as_col + 1)))
-            } else {
-                (None, None)
-            }
+                AliasCols {
+                    as_col,
+                    alias_col: align_after(as_col + 1),
+                }
+            })
         };
 
         let mut out = Vec::new();
@@ -244,21 +245,12 @@ impl Fmt {
                 l.push(','); // now at content_col
                 l
             };
-            self.render_select_item(
-                item,
-                &mut line,
-                &mut out,
-                content_col,
-                river,
-                as_col,
-                alias_col,
-            );
+            self.render_select_item(item, &mut line, &mut out, content_col, river, alias_cols);
             self.attach_trailing(item.span().end.line, &mut out);
         }
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_select_item(
         &self,
         item: &SelectItem,
@@ -266,10 +258,9 @@ impl Fmt {
         out: &mut Vec<String>,
         content_col: usize,
         river: usize,
-        as_col: Option<usize>,
-        alias_col: Option<usize>,
+        alias_cols: Option<AliasCols>,
     ) {
-        let (expr, alias) = match item {
+        let (expr, alias_name) = match item {
             SelectItem::UnnamedExpr(e) => (Some(e), None),
             SelectItem::ExprWithAlias { expr, alias } => (Some(expr), Some(alias.to_string())),
             SelectItem::Wildcard(_) => {
@@ -290,18 +281,13 @@ impl Fmt {
             }
         };
         let expr = expr.unwrap();
+        let alias = Alias {
+            name: alias_name.as_deref(),
+            cols: alias_cols,
+        };
 
         if let Some(block) = self.block_kind(expr) {
-            self.render_block_expr(
-                block,
-                line,
-                out,
-                content_col,
-                river,
-                alias.as_deref(),
-                as_col,
-                alias_col,
-            );
+            self.render_block_expr(block, line, out, content_col, river, alias);
             return;
         }
 
@@ -310,36 +296,30 @@ impl Fmt {
             line.push('(');
             out.push(std::mem::take(line));
             out.extend(self.river_lines(inner, river + 4));
-            out.push(self.close_paren(content_col, alias.as_deref(), as_col, alias_col));
+            out.push(self.close_paren(content_col, alias));
             return;
         }
 
         // Inline item.
         line.push_str(&self.inline(expr));
-        self.append_alias(line, alias.as_deref(), as_col, alias_col);
+        self.append_alias(line, alias);
         out.push(std::mem::take(line));
     }
 
     /// Append `AS <alias>` to `line`, with `AS` and the alias name snapped to
-    /// `as_col` / `alias_col` (a single space when those aren't given).
-    fn append_alias(
-        &self,
-        line: &mut String,
-        alias: Option<&str>,
-        as_col: Option<usize>,
-        alias_col: Option<usize>,
-    ) {
-        let Some(alias) = alias else { return };
-        match as_col {
-            Some(col) => pad_to(line, col),
+    /// the aligned columns (a single space when the alias isn't aligned).
+    fn append_alias(&self, line: &mut String, alias: Alias) {
+        let Some(name) = alias.name else { return };
+        match alias.cols {
+            Some(c) => pad_to(line, c.as_col),
             None => line.push(' '),
         }
         line.push_str("AS");
-        match alias_col {
-            Some(col) => pad_to(line, col),
+        match alias.cols {
+            Some(c) => pad_to(line, c.alias_col),
             None => line.push(' '),
         }
-        line.push_str(alias);
+        line.push_str(name);
     }
 
     /// The column of the last character of an aliased item's value, used to
@@ -377,7 +357,6 @@ impl Fmt {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_block_expr(
         &self,
         block: Block,
@@ -385,26 +364,24 @@ impl Fmt {
         out: &mut Vec<String>,
         content_col: usize,
         river: usize,
-        alias: Option<&str>,
-        as_col: Option<usize>,
-        alias_col: Option<usize>,
+        alias: Alias,
     ) {
         let body_ci = river + 4;
         // The closing paren / END lines up with the opening value column, and
         // carries the aligned alias.
         match block {
-            Block::Case(e) => self.render_case(e, line, out, content_col, alias, as_col, alias_col),
+            Block::Case(e) => self.render_case(e, line, out, content_col, alias),
             Block::Subquery(q) => {
                 line.push('(');
                 out.push(std::mem::take(line));
                 out.extend(self.query(q, body_ci));
-                out.push(self.close_paren(content_col, alias, as_col, alias_col));
+                out.push(self.close_paren(content_col, alias));
             }
             Block::Exists(q, negated) => {
                 line.push_str(if negated { "NOT EXISTS (" } else { "EXISTS (" });
                 out.push(std::mem::take(line));
                 out.extend(self.query(q, body_ci));
-                out.push(self.close_paren(content_col, alias, as_col, alias_col));
+                out.push(self.close_paren(content_col, alias));
             }
             Block::Window(f) => {
                 // Render the call head without its OVER clause.
@@ -416,23 +393,20 @@ impl Fmt {
                 if let Some(WindowType::WindowSpec(spec)) = &f.over {
                     out.extend(self.window_body(spec, body_ci));
                 }
-                out.push(self.close_paren(content_col, alias, as_col, alias_col));
+                out.push(self.close_paren(content_col, alias));
             }
         }
     }
 
     /// `CASE` expands to a block: `WHEN`/`ELSE` indent +4 from the value
     /// column, `END` returns to the value column and carries the alias.
-    #[allow(clippy::too_many_arguments)]
     fn render_case(
         &self,
         e: &Expr,
         line: &mut String,
         out: &mut Vec<String>,
         content_col: usize,
-        alias: Option<&str>,
-        as_col: Option<usize>,
-        alias_col: Option<usize>,
+        alias: Alias,
     ) {
         let Expr::Case {
             operand,
@@ -471,20 +445,14 @@ impl Fmt {
 
         let mut end = pad(content_col);
         end.push_str("END");
-        self.append_alias(&mut end, alias, as_col, alias_col);
+        self.append_alias(&mut end, alias);
         out.push(end);
     }
 
-    fn close_paren(
-        &self,
-        col: usize,
-        alias: Option<&str>,
-        as_col: Option<usize>,
-        alias_col: Option<usize>,
-    ) -> String {
+    fn close_paren(&self, col: usize, alias: Alias) -> String {
         let mut l = pad(col);
         l.push(')');
-        self.append_alias(&mut l, alias, as_col, alias_col);
+        self.append_alias(&mut l, alias);
         l
     }
 
@@ -514,9 +482,9 @@ impl Fmt {
     // ---------- FROM / JOIN ----------
 
     fn from(&self, tables: &[TableWithJoins], ci: usize) -> Vec<String> {
-        // Collect (keyword, relation, on, span) descriptors first so the
-        // keyword column can be fixed before rendering any derived-table body.
-        let mut descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)> = Vec::new();
+        // Collect relation descriptors first so the keyword column can be fixed
+        // before rendering any derived-table body.
+        let mut descs = Vec::new();
         self.push_relation_descs("FROM", tables, &mut descs);
         self.render_rows(descs, ci)
     }
@@ -525,11 +493,7 @@ impl Fmt {
     /// shared grid: keyword, table, alias, and `ON` each get a column; a derived
     /// table drops its `(...)` body below and carries the alias / `ON` on the
     /// closing-paren line.
-    fn render_rows(
-        &self,
-        descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)>,
-        ci: usize,
-    ) -> Vec<String> {
+    fn render_rows(&self, descs: Vec<RelationDesc>, ci: usize) -> Vec<String> {
         let (rows, cols) = self.layout_rows(descs, ci);
         let mut out = Vec::new();
         for row in &rows {
@@ -542,20 +506,18 @@ impl Fmt {
     /// alias, `ON`, condition) for a relation group, without emitting anything.
     /// Splitting layout from emission lets a caller (e.g. UPDATE ... FROM)
     /// interleave other clauses between rows while keeping the aliases aligned.
-    fn layout_rows(
-        &self,
-        descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)>,
-        ci: usize,
-    ) -> (Vec<Row>, RowCols) {
-        let kw_max = descs.iter().map(|d| d.0.chars().count()).max().unwrap_or(0);
+    fn layout_rows(&self, descs: Vec<RelationDesc>, ci: usize) -> (Vec<Row>, RowCols) {
+        let kw_max = descs
+            .iter()
+            .map(|d| d.kw.chars().count())
+            .max()
+            .unwrap_or(0);
         let table_col = align_after(ci + kw_max.saturating_sub(1));
 
         // Build rows, rendering derived-table bodies at table_col + 4.
         let rows: Vec<Row> = descs
             .into_iter()
-            .map(|(kw, tf, on, start, end)| {
-                self.relation_row(kw, tf, on, start, end, ci, table_col)
-            })
+            .map(|d| self.relation_row(d, ci, table_col))
             .collect();
 
         // The alias column follows the widest "table" cell; a derived table's
@@ -640,18 +602,15 @@ impl Fmt {
         self.attach_trailing(row.end_line, out);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn relation_row(
-        &self,
-        kw: String,
-        tf: &TableFactor,
-        on: Option<OnClause>,
-        start_line: u64,
-        end_line: u64,
-        ci: usize,
-        table_col: usize,
-    ) -> Row {
-        let (table, alias, body, table_end) = match tf {
+    fn relation_row(&self, desc: RelationDesc, ci: usize, table_col: usize) -> Row {
+        let RelationDesc {
+            kw,
+            factor,
+            on,
+            start_line,
+            end_line,
+        } = desc;
+        let (table, alias, body, table_end) = match factor {
             TableFactor::Table { name, alias, .. } => {
                 let t = self.post(&name.to_string());
                 let end = table_col + t.chars().count().saturating_sub(1);
@@ -767,9 +726,7 @@ impl Fmt {
                 out,
                 operand_col,
                 operand_col,
-                None,
-                None,
-                None,
+                Alias::NONE,
             );
         } else {
             prefix.push_str(&self.inline(operand));
@@ -901,14 +858,20 @@ impl Fmt {
         let ts = m.table.span();
         let ss = m.source.span();
         let descs = vec![
-            (into_kw, &m.table, None, ts.start.line, ts.end.line),
-            (
-                "USING".to_string(),
-                &m.source,
-                Some(OnClause::On(m.on.clone())),
-                ss.start.line,
-                ss.end.line,
-            ),
+            RelationDesc {
+                kw: into_kw,
+                factor: &m.table,
+                on: None,
+                start_line: ts.start.line,
+                end_line: ts.end.line,
+            },
+            RelationDesc {
+                kw: "USING".to_string(),
+                factor: &m.source,
+                on: Some(OnClause::On(m.on.clone())),
+                start_line: ss.start.line,
+                end_line: ss.end.line,
+            },
         ];
         out.extend(self.render_rows(descs, ci));
 
@@ -1089,7 +1052,7 @@ impl Fmt {
             None => ([].as_slice(), false),
         };
 
-        let mut descs: Vec<(String, &TableFactor, Option<OnClause>, u64, u64)> = Vec::new();
+        let mut descs = Vec::new();
         self.push_relation_descs("UPDATE", std::slice::from_ref(&u.table), &mut descs);
         self.push_relation_descs("FROM", from_tables, &mut descs);
 
@@ -1124,16 +1087,28 @@ impl Fmt {
         &self,
         lead: &str,
         tables: &'a [TableWithJoins],
-        descs: &mut Vec<(String, &'a TableFactor, Option<OnClause>, u64, u64)>,
+        descs: &mut Vec<RelationDesc<'a>>,
     ) {
         for (ti, twj) in tables.iter().enumerate() {
             let kw = if ti == 0 { lead } else { "," }.to_string();
             let s = twj.relation.span();
-            descs.push((kw, &twj.relation, None, s.start.line, s.end.line));
+            descs.push(RelationDesc {
+                kw,
+                factor: &twj.relation,
+                on: None,
+                start_line: s.start.line,
+                end_line: s.end.line,
+            });
             for join in &twj.joins {
                 let (kw, on) = self.join_parts(join);
                 let s = join.span();
-                descs.push((kw, &join.relation, on, s.start.line, s.end.line));
+                descs.push(RelationDesc {
+                    kw,
+                    factor: &join.relation,
+                    on,
+                    start_line: s.start.line,
+                    end_line: s.end.line,
+                });
             }
         }
     }
@@ -1206,6 +1181,43 @@ enum Block<'e> {
     Exists(&'e Query, bool),
     Window(&'e sqlparser::ast::Function),
     Case(&'e Expr),
+}
+
+/// A trailing `AS <name>` alias to render, with the columns it snaps to. A
+/// `None` `name` renders nothing; `None` `cols` renders with single spaces
+/// instead of aligning.
+#[derive(Clone, Copy)]
+struct Alias<'a> {
+    name: Option<&'a str>,
+    cols: Option<AliasCols>,
+}
+
+impl Alias<'_> {
+    /// No alias at all (used where an expression can't carry one).
+    const NONE: Alias<'static> = Alias {
+        name: None,
+        cols: None,
+    };
+}
+
+/// The `AS` / alias-name columns a projection's aliases align to: `AS` snaps to
+/// `as_col`, the name to `alias_col`.
+#[derive(Clone, Copy)]
+struct AliasCols {
+    as_col: usize,
+    alias_col: usize,
+}
+
+/// A single relation row to lay out — a FROM/JOIN entry, MERGE's INTO/USING, or
+/// UPDATE's target/FROM table: its leading keyword, the table factor, an
+/// optional join condition, and the source line span used for comment
+/// anchoring.
+struct RelationDesc<'a> {
+    kw: String,
+    factor: &'a TableFactor,
+    on: Option<OnClause>,
+    start_line: u64,
+    end_line: u64,
 }
 
 /// The shared grid columns resolved for a relation group.
