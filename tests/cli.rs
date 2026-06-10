@@ -38,6 +38,12 @@ fn examples_are_already_formatted() {
         .expect("read examples/")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        // `_`-prefixed files are style illustrations, not formattable SQL.
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('_'))
+        })
         .collect();
     paths.sort();
     assert!(!paths.is_empty(), "no example files found");

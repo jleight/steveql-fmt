@@ -802,7 +802,7 @@ impl Fmt {
         // Multi-line: the comma sits tight after the keyword, content one space
         // past it (unlike the grid-aligned SELECT-list / window variant).
         let comma_col = ci + kw.len();
-        comma_rows(kw, items, ci, comma_col, comma_col + 1)
+        comma_rows(kw, items, ci, comma_col, comma_col + 1, "")
     }
 
     fn order_item(&self, o: &OrderByExpr) -> String {
@@ -971,27 +971,21 @@ impl Fmt {
             .max()
             .unwrap_or(content);
         let eq_col = align_after(max_last);
-        for (i, a) in assignments.iter().enumerate() {
-            let mut l = if i == 0 {
-                if lead.is_empty() {
-                    pad(content)
-                } else {
-                    let mut s = pad(kw_ci);
-                    s.push_str(lead);
-                    pad_to(&mut s, content);
-                    s
-                }
-            } else {
-                let mut s = pad(indent);
-                s.push(',');
+        // Each item is a complete `target = value`, with `=` snapped to `eq_col`
+        // relative to where the item lands (`content`); the leading-comma /
+        // keyword skeleton is then shared with every other clause.
+        let items: Vec<String> = assignments
+            .iter()
+            .zip(&targets)
+            .map(|(a, t)| {
+                let mut s = t.clone();
+                pad_to(&mut s, eq_col - content);
+                s.push_str("= ");
+                s.push_str(&self.inline(&a.value));
                 s
-            };
-            l.push_str(&targets[i]);
-            pad_to(&mut l, eq_col);
-            l.push_str("= ");
-            l.push_str(&self.inline(&a.value));
-            out.push(l);
-        }
+            })
+            .collect();
+        out.extend(comma_rows(lead, &items, kw_ci, indent, content, ""));
     }
 
     // ---------- INSERT / UPDATE / DELETE ----------
@@ -1139,20 +1133,7 @@ impl Fmt {
     /// A parenthesized leading-comma list with hugging parens: `(` glued to the
     /// first item, `)` glued to the last, leading commas under the `(` at `ci`.
     fn leading_comma_block(&self, items: &[String], ci: usize, out: &mut Vec<String>) {
-        if items.is_empty() {
-            out.push(format!("{}()", pad(ci)));
-            return;
-        }
-        let last = items.len() - 1;
-        for (i, it) in items.iter().enumerate() {
-            let mut l = pad(ci);
-            l.push(if i == 0 { '(' } else { ',' });
-            l.push_str(it);
-            if i == last {
-                l.push(')');
-            }
-            out.push(l);
-        }
+        out.extend(comma_rows("(", items, ci, ci, ci + 1, ")"));
     }
 
     // ---------- inline rendering helpers ----------
@@ -1285,31 +1266,44 @@ fn is_ordinal(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Emit a leading-comma list: `kw` heads the first line with its first item at
-/// `content_col`, and every later item sits under a leading comma at
-/// `comma_col`. The two columns are the only thing that varies between the
-/// grid-aligned variant ([`comma_list`], SELECT list) and the keyword-tight
-/// variant ([`Fmt::kw_list`], GROUP BY / ORDER BY).
+/// Emit a wrapped, leading-comma item list — the one layout primitive behind
+/// every comma-separated clause:
+/// - the first line is `lead` (a clause keyword, or an opening `(`) followed by
+///   the first item at `content_col`;
+/// - each later item sits under a leading comma at `comma_col`;
+/// - `close` (e.g. `)`) is appended after the last item.
+///
+/// The call sites differ only in these delimiters and columns: a keyword lead
+/// with an empty close (GROUP BY / ORDER BY, window specs, UPDATE SET) versus a
+/// `(`/`)` pair glued to the items (INSERT columns and value rows).
 fn comma_rows(
-    kw: &str,
+    lead: &str,
     items: &[String],
     ci: usize,
     comma_col: usize,
     content_col: usize,
+    close: &str,
 ) -> Vec<String> {
+    if items.is_empty() {
+        return vec![format!("{}{}{}", pad(ci), lead, close)];
+    }
+    let last = items.len() - 1;
     let mut out = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        if i == 0 {
-            let mut l = format!("{}{}", pad(ci), kw);
+        let mut l = if i == 0 {
+            let mut l = format!("{}{}", pad(ci), lead);
             pad_to(&mut l, content_col);
-            l.push_str(item);
-            out.push(l);
+            l
         } else {
             let mut l = pad(comma_col);
             l.push(',');
-            l.push_str(item);
-            out.push(l);
+            l
+        };
+        l.push_str(item);
+        if i == last {
+            l.push_str(close);
         }
+        out.push(l);
     }
     out
 }
@@ -1318,7 +1312,7 @@ fn comma_rows(
 /// multiple items push the content one tabstop past the comma.
 fn comma_list(kw: &str, items: &[String], ci: usize, grid: usize) -> Vec<String> {
     let content_col = if items.len() > 1 { grid + 1 } else { grid };
-    comma_rows(kw, items, ci, grid, content_col)
+    comma_rows(kw, items, ci, grid, content_col, "")
 }
 
 /// Flatten the top-level AND/OR chain. Returns (operators, operands) where
