@@ -11,10 +11,10 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Cte, Delete, Distinct, Expr,
     FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, Join,
     JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
-    MergeInsertKind, NamedWindowDefinition, NamedWindowExpr, OnConflictAction, OnInsert, OrderBy,
-    OrderByExpr, OrderByKind, OutputClause, Query, Select, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Spanned, Statement, TableAlias, TableFactor, TableObject, TableSampleKind,
-    TableWithJoins, Update, Values, WindowType,
+    MergeInsertKind, MergeUpdateKind, NamedWindowDefinition, NamedWindowExpr, OnConflictAction,
+    OnInsert, OrderBy, OrderByExpr, OrderByKind, OutputClause, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Spanned, Statement, TableAlias, TableFactor, TableObject,
+    TableSampleKind, TableWithJoins, Update, Values, WindowType,
 };
 use std::cell::Cell;
 
@@ -1114,17 +1114,9 @@ impl Fmt {
     }
 
     fn order_item(&self, o: &OrderByExpr) -> String {
+        // The options render with their own leading spaces (` DESC NULLS LAST`).
         let mut s = self.inline(&o.expr);
-        match o.options.asc {
-            Some(true) => s.push_str(" ASC"),
-            Some(false) => s.push_str(" DESC"),
-            None => {}
-        }
-        match o.options.nulls_first {
-            Some(true) => s.push_str(" NULLS FIRST"),
-            Some(false) => s.push_str(" NULLS LAST"),
-            None => {}
-        }
+        s.push_str(&self.post(&o.options.to_string()));
         s
     }
 
@@ -1226,9 +1218,24 @@ impl Fmt {
             MergeAction::Delete { .. } => {
                 out.push(format!("{}DELETE", pad(action)));
             }
+            MergeAction::DoNothing { .. } => {
+                out.push(format!("{}DO NOTHING", pad(action)));
+            }
             MergeAction::Update(u) => {
-                out.push(format!("{}UPDATE SET", pad(action)));
-                self.assignment_list(&u.assignments, "", 0, body, &mut out);
+                match &u.kind {
+                    MergeUpdateKind::Set(assignments) => {
+                        out.push(format!("{}UPDATE SET", pad(action)));
+                        self.assignment_list(assignments, "", 0, body, &mut out);
+                    }
+                    MergeUpdateKind::Wildcard => out.push(format!("{}UPDATE SET *", pad(action))),
+                }
+                // Oracle's `WHERE` / `DELETE WHERE` follow the assignments.
+                if let Some(pred) = &u.update_predicate {
+                    out.extend(self.river("WHERE", pred, action));
+                }
+                if let Some(pred) = &u.delete_predicate {
+                    out.extend(self.river("DELETE WHERE", pred, action));
+                }
             }
             MergeAction::Insert(ins) => {
                 let cols: Vec<String> = ins
@@ -1240,16 +1247,23 @@ impl Fmt {
                     MergeInsertKind::Row if cols.is_empty() => {
                         out.push(format!("{}INSERT ROW", pad(action)));
                     }
+                    MergeInsertKind::Wildcard => {
+                        out.push(format!("{}INSERT *", pad(action)));
+                    }
                     _ => {
                         out.push(format!("{}INSERT", pad(action)));
                         self.leading_comma_block(&cols, body, &mut out);
                         match &ins.kind {
-                            MergeInsertKind::Row => out.push(format!("{}ROW", pad(action))),
                             MergeInsertKind::Values(v) => {
                                 self.values_rows(v, action, body, &mut out)
                             }
+                            _ => out.push(format!("{}ROW", pad(action))),
                         }
                     }
+                }
+                // Oracle's `WHERE` follows the inserted values.
+                if let Some(pred) = &ins.insert_predicate {
+                    out.extend(self.river("WHERE", pred, action));
                 }
             }
         }
