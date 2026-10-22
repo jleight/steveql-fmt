@@ -8,10 +8,12 @@
 
 use crate::funcs;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, Cte, Delete, Distinct, Expr, FromTable,
-    GroupByExpr, Insert, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause,
-    MergeClauseKind, MergeInsertKind, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Spanned, Statement, TableFactor, TableObject,
+    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Cte, Delete, Distinct, Expr,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, Join,
+    JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
+    MergeInsertKind, NamedWindowDefinition, NamedWindowExpr, OnConflictAction, OnInsert, OrderBy,
+    OrderByExpr, OrderByKind, OutputClause, Query, Select, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Spanned, Statement, TableAlias, TableFactor, TableObject, TableSampleKind,
     TableWithJoins, Update, Values, WindowType,
 };
 use std::cell::Cell;
@@ -67,6 +69,10 @@ impl Fmt {
             Statement::Insert(i) => out.extend(self.insert(i, 0)),
             Statement::Update(u) => out.extend(self.update(u, 0)),
             Statement::Delete(d) => out.extend(self.delete(d, 0)),
+            Statement::CreateTable(ct) if ct.query.is_some() => {
+                out.extend(self.query_after_header(stmt, ct.query.as_ref().unwrap()))
+            }
+            Statement::CreateView(cv) => out.extend(self.query_after_header(stmt, &cv.query)),
             // Anything we don't lay out by hand falls back to compact SQL.
             other => out.push(self.post(&other.to_string())),
         }
@@ -74,6 +80,28 @@ impl Fmt {
         // are emitted so nothing is ever dropped.
         self.flush_before(u64::MAX, 0, &mut out);
         out.join("\n")
+    }
+
+    /// A statement that ends in a query (`CREATE TABLE ... AS`, `CREATE VIEW
+    /// ... AS`): everything before `AS` stays on one header line, `AS` gets a
+    /// line of its own, and the query is laid out below it at the statement's
+    /// indent. Anything after the query (e.g. `WITH NO DATA`) can't be split
+    /// off that way, so such a statement stays compact.
+    fn query_after_header(&self, stmt: &Statement, q: &Query) -> Vec<String> {
+        let full = stmt.to_string();
+        let body = q.to_string();
+        match full.strip_suffix(&body) {
+            Some(header) => {
+                let header = header.trim_end();
+                let mut out = match header.strip_suffix(" AS") {
+                    Some(name) => vec![self.post(name), "AS".to_string()],
+                    None => vec![self.post(header)],
+                };
+                out.extend(self.query(q, 0));
+                out
+            }
+            None => vec![self.post(&full)],
+        }
     }
 
     // ---------- comment re-attachment ----------
@@ -124,6 +152,14 @@ impl Fmt {
             out.extend(self.limit(lc, ci));
         }
 
+        // `FETCH` and the locking clauses read naturally as one line each.
+        if let Some(fetch) = &q.fetch {
+            out.push(format!("{}{}", pad(ci), self.post(&fetch.to_string())));
+        }
+        for lock in &q.locks {
+            out.push(format!("{}{}", pad(ci), self.post(&lock.to_string())));
+        }
+
         out
     }
 
@@ -131,13 +167,17 @@ impl Fmt {
         let name_indent = ci + 4;
         let body_ci = ci + 8;
         for (i, cte) in ctes.iter().enumerate() {
-            let name = cte.alias.name.to_string();
+            let name = alias_text(&cte.alias);
+            let as_kw = match &cte.materialized {
+                Some(m) => format!("AS {m}"),
+                None => "AS".to_string(),
+            };
             self.flush_before(cte.query.span().start.line, name_indent, out);
             if i == 0 {
                 let kw = if recursive { "WITH RECURSIVE" } else { "WITH" };
-                out.push(format!("{}{} {} AS (", pad(ci), kw, name));
+                out.push(format!("{}{} {} {} (", pad(ci), kw, name, as_kw));
             } else {
-                out.push(format!("{},{} AS (", pad(name_indent), name));
+                out.push(format!("{},{} {} (", pad(name_indent), name, as_kw));
             }
             out.extend(self.query(&cte.query, body_ci));
             out.push(format!("{})", pad(name_indent)));
@@ -147,16 +187,37 @@ impl Fmt {
     fn set_expr(&self, body: &SetExpr, ci: usize) -> Vec<String> {
         match body {
             SetExpr::Select(s) => self.select(s, ci),
-            SetExpr::Query(q) => self.query(q, ci),
+            // A parenthesized query keeps its parentheses, which decide what an
+            // ORDER BY or LIMIT inside a set operation applies to. Laid out like
+            // a derived table: `(` alone, the body one level in, `)` back out.
+            SetExpr::Query(q) => {
+                let mut out = vec![format!("{}(", pad(ci))];
+                out.extend(self.query(q, ci + 4));
+                out.push(format!("{})", pad(ci)));
+                out
+            }
             SetExpr::SetOperation {
                 left,
                 op,
                 set_quantifier,
                 right,
             } => {
+                // A blank line sets each query apart from the operator, unless
+                // the query is parenthesized: its parens already do that.
                 let mut out = self.set_expr(left, ci);
+                if !ends_in_parens(left) {
+                    out.push(String::new());
+                }
                 out.push(format!("{}{}", pad(ci), set_op_str(op, set_quantifier)));
+                if !starts_in_parens(right) {
+                    out.push(String::new());
+                }
                 out.extend(self.set_expr(right, ci));
+                out
+            }
+            SetExpr::Values(v) => {
+                let mut out = Vec::new();
+                self.values_rows(v, ci, ci + 4, &mut out);
                 out
             }
             // A CTE in front of a DML statement (`WITH ... UPDATE/INSERT/...`)
@@ -174,19 +235,77 @@ impl Fmt {
 
     fn select(&self, s: &Select, ci: usize) -> Vec<String> {
         let mut out = self.projection(s, ci);
+        if let Some(into) = &s.into {
+            // `SelectInto`'s Display leads with the INTO keyword itself.
+            let target = into.to_string();
+            let target = target.strip_prefix("INTO ").unwrap_or(&target);
+            out.push(clause_line("INTO", &self.post(target), ci));
+        }
         if !s.from.is_empty() {
             out.extend(self.from(&s.from, ci));
         }
         if let Some(sel) = &s.selection {
             out.extend(self.river("WHERE", sel, ci));
         }
-        if let GroupByExpr::Expressions(exprs, _) = &s.group_by {
-            if !exprs.is_empty() {
-                out.extend(self.group_by(exprs, ci));
+        match &s.group_by {
+            GroupByExpr::All(_) => out.push(format!("{}GROUP BY ALL", pad(ci))),
+            GroupByExpr::Expressions(exprs, modifiers) => {
+                if !exprs.is_empty() {
+                    out.extend(self.group_by(exprs, ci));
+                }
+                if let Some(last) = out.last_mut().filter(|_| !modifiers.is_empty()) {
+                    for m in modifiers {
+                        last.push(' ');
+                        last.push_str(&m.to_string());
+                    }
+                }
             }
         }
         if let Some(having) = &s.having {
             out.extend(self.river("HAVING", having, ci));
+        }
+        // WINDOW and QUALIFY keep the order they were written in.
+        if s.window_before_qualify {
+            out.extend(self.named_windows(&s.named_window, ci));
+        }
+        if let Some(qualify) = &s.qualify {
+            out.extend(self.river("QUALIFY", qualify, ci));
+        }
+        if !s.window_before_qualify {
+            out.extend(self.named_windows(&s.named_window, ci));
+        }
+        out
+    }
+
+    /// The `WINDOW` clause: one definition per line with leading commas, each
+    /// spec expanded like an `OVER (...)` block in the SELECT list.
+    fn named_windows(&self, defs: &[NamedWindowDefinition], ci: usize) -> Vec<String> {
+        let grid = align_after(ci + "WINDOW".len() - 1);
+        let content_col = if defs.len() > 1 { grid + 1 } else { grid };
+        let mut out = Vec::new();
+        for (i, NamedWindowDefinition(name, expr)) in defs.iter().enumerate() {
+            let mut line = if i == 0 {
+                let mut l = format!("{}WINDOW", pad(ci));
+                pad_to(&mut l, content_col);
+                l
+            } else {
+                let mut l = pad(grid);
+                l.push(',');
+                l
+            };
+            line.push_str(&format!("{name} AS "));
+            match expr {
+                NamedWindowExpr::WindowSpec(spec) if expands(spec) => {
+                    line.push('(');
+                    out.push(line);
+                    out.extend(self.window_body(spec, grid + 4));
+                    out.push(format!("{})", pad(content_col)));
+                }
+                other => {
+                    line.push_str(&self.post(&other.to_string()));
+                    out.push(line);
+                }
+            }
         }
         out
     }
@@ -198,20 +317,43 @@ impl Fmt {
                 let list = exprs.iter().map(|e| self.inline(e)).collect::<Vec<_>>();
                 format!("SELECT DISTINCT ON ({})", list.join(", "))
             }
-            // Distinct / All / any other quantifier.
-            Some(_) => "SELECT DISTINCT".to_string(),
+            Some(Distinct::Distinct) => "SELECT DISTINCT".to_string(),
+            Some(Distinct::All) => "SELECT ALL".to_string(),
         };
+        self.item_list(&kw, &s.projection, ci)
+    }
 
-        let n = s.projection.len();
-        let multi = n > 1;
-        // Items normally align after the keyword. A long keyword (any DISTINCT
-        // variant) would push them far to the right, so instead it sits alone
-        // on its line and the items drop to the standard SELECT grid — keeping
-        // them aligned with the FROM / WHERE / GROUP BY below.
+    /// A SELECT list under `kw`. Items normally align after the keyword. A
+    /// long keyword (any DISTINCT variant) would push them far to the right,
+    /// so instead it sits alone on its line and the items drop to the standard
+    /// SELECT grid — keeping them aligned with the FROM / WHERE / GROUP BY
+    /// below.
+    fn item_list(&self, kw: &str, items: &[SelectItem], ci: usize) -> Vec<String> {
         let base_grid = align_after(ci + "SELECT".len() - 1);
         let kw_grid = align_after(ci + kw.chars().count() - 1);
         let wrap = kw_grid > base_grid;
         let grid = if wrap { base_grid } else { kw_grid };
+        self.items_on_grid(kw, items, ci, grid, wrap)
+    }
+
+    /// A `RETURNING` list: the keyword alone on its line, the items one
+    /// tabstop in, like an INSERT column list.
+    fn returning(&self, items: &[SelectItem], ci: usize) -> Vec<String> {
+        self.items_on_grid("RETURNING", items, ci, ci + 4, true)
+    }
+
+    /// A list of SELECT items with leading commas at `grid` (content one past
+    /// it when there are several) and aligned aliases. With `wrap`, `kw` heads
+    /// its own line; otherwise the first item follows it.
+    fn items_on_grid(
+        &self,
+        kw: &str,
+        items: &[SelectItem],
+        ci: usize,
+        grid: usize,
+        wrap: bool,
+    ) -> Vec<String> {
+        let multi = items.len() > 1;
         let comma_col = grid;
         let content_col = if multi { grid + 1 } else { grid };
         let river = grid; // close-paren column for block items
@@ -222,7 +364,7 @@ impl Fmt {
         let alias_cols = {
             let mut max_end = 0usize;
             let mut any = false;
-            for item in &s.projection {
+            for item in items {
                 if let SelectItem::ExprWithAlias { expr, .. } = item {
                     any = true;
                     max_end = max_end.max(self.value_end(expr, content_col));
@@ -240,12 +382,12 @@ impl Fmt {
         let mut out = Vec::new();
         if wrap {
             // The keyword heads its own line; any header comment stays above it.
-            if let Some(first) = s.projection.first() {
+            if let Some(first) = items.first() {
                 self.flush_before(first.span().start.line, ci, &mut out);
             }
             out.push(format!("{}{}", pad(ci), kw));
         }
-        for (i, item) in s.projection.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             // A comment before the first item is a header at the clause indent;
             // comments between items align with the leading commas.
             let comment_col = if i == 0 { ci } else { comma_col };
@@ -305,8 +447,8 @@ impl Fmt {
             cols: alias_cols,
         };
 
-        if let Some(block) = self.block_kind(expr) {
-            self.render_block_expr(block, line, out, content_col, river, alias);
+        if let Some(split) = self.split(expr) {
+            self.render_split(split, line, out, content_col, river, alias);
             return;
         }
 
@@ -342,43 +484,153 @@ impl Fmt {
     }
 
     /// The column of the last character of an aliased item's value, used to
-    /// place the shared `AS` column. Blocks end at their closing `)` (or `END`).
+    /// place the shared `AS` column. A block ends on its closing line: `)` or
+    /// `END` plus whatever follows it, like `END)` or `) = 1`.
     fn value_end(&self, expr: &Expr, content_col: usize) -> usize {
-        if matches!(expr, Expr::Case { .. }) {
-            content_col + 2 // "END"
-        } else if self.is_block(expr) {
-            content_col // closing ")"
-        } else {
-            content_col + self.inline(expr).chars().count().saturating_sub(1)
-        }
+        let width = match self.split(expr) {
+            Some(s) => s.block.close().len() + s.tail.chars().count(),
+            None if nested_bool(expr).is_some() => 1, // closing ")"
+            None => self.inline(expr).chars().count(),
+        };
+        content_col + width.saturating_sub(1)
     }
 
-    // ---------- block expressions (subquery / EXISTS / window) ----------
+    // ---------- block expressions (subquery / window / CASE) ----------
 
-    fn is_block(&self, e: &Expr) -> bool {
-        self.block_kind(e).is_some() || nested_bool(e).is_some()
-    }
-
-    fn block_kind<'e>(&self, e: &'e Expr) -> Option<Block<'e>> {
+    /// Find the block an expression lays out around: a subquery, an expanding
+    /// window spec, or a `CASE`, either the expression itself or one level
+    /// down (an operand of a comparison, the target of `IN`, an argument of
+    /// a call, the query of `EXISTS`). Everything around the block renders
+    /// inline, before its opening line or after its closing one. A short
+    /// subquery isn't a block; it stays inline.
+    fn split<'e>(&self, e: &'e Expr) -> Option<Split<'e>> {
+        let wrap = |head: String, inner: Split<'e>, tail: &str| inner.wrap(head, tail);
         match e {
-            Expr::Subquery(q) => Some(Block::Subquery(q)),
-            Expr::Exists { subquery, negated } => Some(Block::Exists(subquery, *negated)),
+            Expr::Subquery(q) if !is_short(q) => Some(Split::bare(Block::Query(q))),
+            Expr::Exists { subquery, negated } if !is_short(subquery) => {
+                let kw = if *negated { "NOT EXISTS " } else { "EXISTS " };
+                Some(wrap(
+                    kw.to_string(),
+                    Split::bare(Block::Query(subquery)),
+                    "",
+                ))
+            }
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } if !is_short(subquery) => {
+                let not = if *negated { "NOT " } else { "" };
+                let head = format!("{} {not}IN ", self.inline(expr));
+                Some(wrap(head, Split::bare(Block::Query(subquery)), ""))
+            }
+            Expr::Case { .. } => Some(Split::bare(Block::Case(e))),
             Expr::Function(f) => {
                 if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                    if !spec.partition_by.is_empty() || !spec.order_by.is_empty() {
-                        return Some(Block::Window(f));
+                    if !expands(spec) {
+                        return None;
+                    }
+                    let mut bare = f.clone();
+                    bare.over = None;
+                    let head = format!("{} OVER ", self.inline(&Expr::Function(bare)));
+                    return Some(wrap(head, Split::bare(Block::Window(spec)), ""));
+                }
+                // A lone argument holding a block wraps it (`SUM(CASE`). With
+                // several, the call becomes the block: one argument per line.
+                let open = self.post(&format!("{}(", f.name));
+                match plain_args(f)? {
+                    [arg] => Some(wrap(open, self.split(unnamed_expr(arg)?)?, ")")),
+                    args => {
+                        let any_block = args
+                            .iter()
+                            .any(|a| unnamed_expr(a).is_some_and(|e| self.split(e).is_some()));
+                        any_block.then(|| wrap(open, Split::bare(Block::Args(args)), ""))
                     }
                 }
-                None
             }
-            Expr::Case { .. } => Some(Block::Case(e)),
+            Expr::BinaryOp { left, op, right }
+                if !matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+            {
+                if let Some(s) = self.split(left) {
+                    let tail = format!(" {op} {}", self.inline(right));
+                    Some(wrap(String::new(), s, &tail))
+                } else {
+                    let head = format!("{} {op} ", self.inline(left));
+                    Some(wrap(head, self.split(right)?, ""))
+                }
+            }
             _ => None,
         }
     }
 
-    fn render_block_expr(
+    /// Split a parenthesized list (a VALUES row) at its first item holding a
+    /// block: `open` and the items before it lead the
+    /// opening line, and the items after it follow the block's closing `)` /
+    /// `END`, along with the list's own `)`. `exprs` has the expression behind
+    /// each of `texts`, where there is one to split.
+    fn split_list<'e>(
         &self,
-        block: Block,
+        open: &str,
+        texts: &[String],
+        exprs: &[Option<&'e Expr>],
+    ) -> Option<Split<'e>> {
+        let (i, inner) = exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| Some((i, self.split((*e)?)?)))?;
+        let mut head = open.to_string();
+        for t in &texts[..i] {
+            head.push_str(t);
+            head.push_str(", ");
+        }
+        let mut tail = String::new();
+        for t in &texts[i + 1..] {
+            tail.push_str(", ");
+            tail.push_str(t);
+        }
+        tail.push(')');
+        Some(inner.wrap(head, &tail))
+    }
+
+    /// An expression laid out after `prefix`: one line when it's inline, or,
+    /// when it holds a block, the opening line followed by the block's body
+    /// and closing line (already at their columns). The first line isn't
+    /// indented, so the caller can place it.
+    fn value_lines(
+        &self,
+        prefix: String,
+        e: &Expr,
+        content_col: usize,
+        river: usize,
+    ) -> Vec<String> {
+        let mut line = prefix;
+        match self.split(e) {
+            Some(split) => {
+                let mut lines = Vec::new();
+                self.render_split(
+                    split,
+                    &mut line,
+                    &mut lines,
+                    content_col,
+                    river,
+                    Alias::NONE,
+                );
+                lines
+            }
+            None => {
+                line.push_str(&self.inline(e));
+                vec![line]
+            }
+        }
+    }
+
+    /// Lay out a split expression onto `line`, which is already positioned at
+    /// `content_col`: the head and the block's opening on this line, the
+    /// block's body one tabstop past `river`, and the closing `)` / `END` back
+    /// at `content_col`, carrying the tail and the aligned alias.
+    fn render_split(
+        &self,
+        split: Split,
         line: &mut String,
         out: &mut Vec<String>,
         content_col: usize,
@@ -386,47 +638,50 @@ impl Fmt {
         alias: Alias,
     ) {
         let body_ci = river + 4;
-        // The closing paren / END lines up with the opening value column, and
-        // carries the aligned alias.
-        match block {
-            Block::Case(e) => self.render_case(e, line, out, content_col, alias),
-            Block::Subquery(q) => {
+        line.push_str(&split.head);
+        match split.block {
+            Block::Query(q) => {
                 line.push('(');
                 out.push(std::mem::take(line));
                 out.extend(self.query(q, body_ci));
-                out.push(self.close_paren(content_col, alias));
             }
-            Block::Exists(q, negated) => {
-                line.push_str(if negated { "NOT EXISTS (" } else { "EXISTS (" });
+            Block::Args(args) => {
+                // One argument per line, a tabstop in, with leading commas.
                 out.push(std::mem::take(line));
-                out.extend(self.query(q, body_ci));
-                out.push(self.close_paren(content_col, alias));
+                let comma_col = body_ci;
+                let content = comma_col + 1;
+                let items: Vec<Vec<String>> = args
+                    .iter()
+                    .map(|a| match unnamed_expr(a) {
+                        Some(e) => self.value_lines(String::new(), e, content, comma_col),
+                        None => vec![self.post(&a.to_string())],
+                    })
+                    .collect();
+                out.extend(comma_block_rows(
+                    "", &items, comma_col, comma_col, content, "",
+                ));
             }
-            Block::Window(f) => {
-                // Render the call head without its OVER clause.
-                let mut bare = f.clone();
-                bare.over = None;
-                line.push_str(&self.inline(&Expr::Function(bare)));
-                line.push_str(" OVER (");
+            Block::Window(spec) => {
+                line.push('(');
                 out.push(std::mem::take(line));
-                if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                    out.extend(self.window_body(spec, body_ci));
-                }
-                out.push(self.close_paren(content_col, alias));
+                out.extend(self.window_body(spec, body_ci));
+            }
+            Block::Case(e) => {
+                out.push(std::mem::take(line));
+                self.case_body(e, body_ci, out);
             }
         }
+        let mut close = pad(content_col);
+        close.push_str(split.block.close());
+        close.push_str(&split.tail);
+        self.append_alias(&mut close, alias);
+        out.push(close);
     }
 
-    /// `CASE` expands to a block: `WHEN`/`ELSE` indent +4 from the value
-    /// column, `END` returns to the value column and carries the alias.
-    fn render_case(
-        &self,
-        e: &Expr,
-        line: &mut String,
-        out: &mut Vec<String>,
-        content_col: usize,
-        alias: Alias,
-    ) {
+    /// A `CASE` block up to its `END`: `CASE` (and any operand) is appended to
+    /// the opening line already in `out`, then one `WHEN` / `ELSE` per line at
+    /// `when_col`.
+    fn case_body(&self, e: &Expr, when_col: usize, out: &mut Vec<String>) {
         let Expr::Case {
             operand,
             conditions,
@@ -436,17 +691,12 @@ impl Fmt {
         else {
             return;
         };
-        line.push_str("CASE");
+        let open = out.last_mut().expect("opening line");
+        open.push_str("CASE");
         if let Some(op) = operand {
-            line.push(' ');
-            line.push_str(&self.inline(op));
+            open.push(' ');
+            open.push_str(&self.inline(op));
         }
-        out.push(std::mem::take(line));
-
-        // WHEN/ELSE indent one tabstop in from the value column's tabstop
-        // (the value column may itself be tabstop+1 because of the leading
-        // comma); END stays at the value column, lining up with CASE.
-        let when_col = floor4(content_col) + 4;
         for cw in conditions {
             let mut l = pad(when_col);
             l.push_str("WHEN ");
@@ -461,11 +711,6 @@ impl Fmt {
             l.push_str(&self.inline(er));
             out.push(l);
         }
-
-        let mut end = pad(content_col);
-        end.push_str("END");
-        self.append_alias(&mut end, alias);
-        out.push(end);
     }
 
     fn close_paren(&self, col: usize, alias: Alias) -> String {
@@ -476,7 +721,25 @@ impl Fmt {
     }
 
     fn window_body(&self, spec: &sqlparser::ast::WindowSpec, ci: usize) -> Vec<String> {
-        // PARTITION BY and ORDER BY share one alignment group.
+        // A frame splits into its units (ROWS / RANGE / GROUPS), which join the
+        // keyword column, and the extent, which sits on the grid.
+        let frame = spec.window_frame.as_ref().map(|f| {
+            // A frame has no Display of its own; a spec holding only the frame
+            // renders as just the frame.
+            let only_frame = sqlparser::ast::WindowSpec {
+                window_name: None,
+                partition_by: vec![],
+                order_by: vec![],
+                window_frame: Some(f.clone()),
+            };
+            let text = self.post(&only_frame.to_string());
+            match text.split_once(' ') {
+                Some((units, extent)) => (units.to_string(), extent.to_string()),
+                None => (text, String::new()),
+            }
+        });
+
+        // PARTITION BY, ORDER BY, and the frame units share one alignment group.
         let mut max_kw = 0usize;
         if !spec.partition_by.is_empty() {
             max_kw = max_kw.max("PARTITION BY".len());
@@ -484,9 +747,16 @@ impl Fmt {
         if !spec.order_by.is_empty() {
             max_kw = max_kw.max("ORDER BY".len());
         }
-        let grid = align_after(ci + max_kw - 1);
+        if let Some((units, _)) = &frame {
+            max_kw = max_kw.max(units.len());
+        }
+        let grid = align_after(ci + max_kw.max(1) - 1);
 
         let mut out = Vec::new();
+        // A window built on a named one names it first, on its own line.
+        if let Some(name) = &spec.window_name {
+            out.push(format!("{}{}", pad(ci), name));
+        }
         if !spec.partition_by.is_empty() {
             let items: Vec<String> = spec.partition_by.iter().map(|e| self.inline(e)).collect();
             out.extend(comma_list("PARTITION BY", &items, ci, grid));
@@ -494,6 +764,9 @@ impl Fmt {
         if !spec.order_by.is_empty() {
             let items: Vec<String> = spec.order_by.iter().map(|o| self.order_item(o)).collect();
             out.extend(comma_list("ORDER BY", &items, ci, grid));
+        }
+        if let Some((units, extent)) = frame {
+            out.push(clause_line_at(&units, &extent, ci, grid));
         }
         out
     }
@@ -531,7 +804,11 @@ impl Fmt {
             .map(|d| d.kw.chars().count())
             .max()
             .unwrap_or(0);
-        let table_col = align_after(ci + kw_max.saturating_sub(1));
+        // Comma-separated tables lead with a comma like a SELECT list, so the
+        // table cells sit one past the grid to leave the comma its column.
+        let comma = descs.iter().any(|d| d.kw == ",");
+        let comma_col = align_after(ci + kw_max.saturating_sub(1));
+        let table_col = if comma { comma_col + 1 } else { comma_col };
 
         // Build rows, rendering derived-table bodies at table_col + 4.
         let rows: Vec<Row> = descs
@@ -558,6 +835,7 @@ impl Fmt {
         (
             rows,
             RowCols {
+                comma_col,
                 table_col,
                 alias_col,
                 on_col,
@@ -574,7 +852,11 @@ impl Fmt {
         // alias (the table name, or a derived table's closing paren).
         let mut last = match &row.body {
             None => {
-                let mut l = format!("{}{}", pad(ci), row.kw);
+                let mut l = if row.kw == "," {
+                    format!("{},", pad(cols.comma_col))
+                } else {
+                    format!("{}{}", pad(ci), row.kw)
+                };
                 pad_to(&mut l, cols.table_col);
                 l.push_str(&row.table);
                 l
@@ -630,20 +912,41 @@ impl Fmt {
             end_line,
         } = desc;
         let (table, alias, body, table_end) = match factor {
-            TableFactor::Table { name, alias, .. } => {
-                let t = self.post(&name.to_string());
+            TableFactor::Table { alias, .. } => {
+                // The cell is everything but the alias: arguments of a table
+                // function, WITH ORDINALITY, a TABLESAMPLE written before an
+                // alias. Any other TABLESAMPLE moves to the alias cell.
+                let mut bare = factor.clone();
+                let mut moved = None;
+                if let TableFactor::Table {
+                    alias: a,
+                    sample: s,
+                    ..
+                } = &mut bare
+                {
+                    if a.is_none() || matches!(s, Some(TableSampleKind::AfterTableAlias(_))) {
+                        moved = s.take();
+                    }
+                    *a = None;
+                }
+                let t = self.post(&bare.to_string());
                 let end = table_col + t.chars().count().saturating_sub(1);
-                (t, alias.as_ref().map(|a| a.name.to_string()), None, end)
+                let sample = moved.map(|s| self.post(&sample_text(&s)));
+                (t, alias_cell(alias.as_ref(), sample), None, end)
             }
             TableFactor::Derived {
-                subquery, alias, ..
+                subquery,
+                alias,
+                sample,
+                ..
             } => {
                 // Body indents one level past this clause; its closing paren
                 // returns to this indent, so the table cell ends at `ci`.
                 let body = self.query(subquery, ci + 4);
+                let sample = sample.as_ref().map(|s| self.post(&sample_text(s)));
                 (
                     String::new(),
-                    alias.as_ref().map(|a| a.name.to_string()),
+                    alias_cell(alias.as_ref(), sample),
                     Some(body),
                     ci,
                 )
@@ -682,6 +985,10 @@ impl Fmt {
             JoinOperator::Anti(c) => ("ANTI JOIN", Some(c)),
             _ => ("JOIN", None),
         };
+        let kw = match constraint {
+            Some(JoinConstraint::Natural) => format!("NATURAL {kw}"),
+            _ => kw.to_string(),
+        };
         let on = match constraint {
             Some(JoinConstraint::On(e)) => Some(OnClause::On(Box::new(e.clone()))),
             Some(JoinConstraint::Using(cols)) => {
@@ -690,7 +997,7 @@ impl Fmt {
             }
             _ => None,
         };
-        (kw.to_string(), on)
+        (kw, on)
     }
 
     // ---------- WHERE / HAVING river ----------
@@ -737,10 +1044,11 @@ impl Fmt {
             out.push(prefix);
             out.extend(self.river_lines(inner, operand_col));
             out.push(format!("{})", pad(close_col)));
-        } else if let Some(block) = self.block_kind(operand) {
-            // EXISTS / subquery operand expands as a block at its own column.
-            self.render_block_expr(
-                block,
+        } else if let Some(split) = self.split(operand) {
+            // A subquery / window / CASE operand expands as a block at its own
+            // column.
+            self.render_split(
+                split,
                 &mut prefix,
                 out,
                 operand_col,
@@ -838,8 +1146,10 @@ impl Fmt {
                     out.push(line);
                 }
                 if let Some(o) = offset {
-                    // `Offset`'s Display already includes the OFFSET keyword.
-                    out.push(format!("{}{}", pad(ci), self.post(&o.to_string())));
+                    // `Offset`'s Display leads with the OFFSET keyword itself.
+                    let text = self.post(&o.to_string());
+                    let value = text.strip_prefix("OFFSET ").unwrap_or(&text);
+                    out.push(clause_line_at("OFFSET", value, ci, grid));
                 }
             }
             LimitClause::OffsetCommaLimit { offset, limit } => {
@@ -882,6 +1192,13 @@ impl Fmt {
 
         for clause in &m.clauses {
             out.extend(self.merge_clause(clause, ci));
+        }
+        match &m.output {
+            Some(OutputClause::Returning { select_items, .. }) => {
+                out.extend(self.returning(select_items, ci))
+            }
+            Some(other) => out.push(format!("{}{}", pad(ci), self.post(&other.to_string()))),
+            None => {}
         }
         out
     }
@@ -950,8 +1267,10 @@ impl Fmt {
     }
 
     /// A `SET` list: one `target = value` per line at `indent`, leading commas,
-    /// with the `=` aligned to the tabstop past the widest target. A non-empty
-    /// `lead` keyword (e.g. `SET`) prefixes the first line at `kw_ci`.
+    /// with the `=` aligned to the tabstop past the widest target. A lone
+    /// assignment needs neither, so it sits at `indent` with a single space
+    /// before `=`. A non-empty `lead` keyword (e.g. `SET`) prefixes the first
+    /// line at `kw_ci`.
     fn assignment_list(
         &self,
         assignments: &[Assignment],
@@ -960,44 +1279,85 @@ impl Fmt {
         indent: usize,
         out: &mut Vec<String>,
     ) {
-        let content = indent + 1;
+        let multi = assignments.len() > 1;
+        let content = if multi { indent + 1 } else { indent };
         let targets: Vec<String> = assignments
             .iter()
             .map(|a| self.assignment_target(&a.target))
             .collect();
-        let max_last = targets
-            .iter()
-            .map(|t| content + t.chars().count().saturating_sub(1))
-            .max()
-            .unwrap_or(content);
-        let eq_col = align_after(max_last);
+        let eq_col = if multi {
+            let max_last = targets
+                .iter()
+                .map(|t| content + t.chars().count().saturating_sub(1))
+                .max()
+                .unwrap_or(content);
+            align_after(max_last)
+        } else {
+            content + targets[0].chars().count() + 1
+        };
         // Each item is a complete `target = value`, with `=` snapped to `eq_col`
         // relative to where the item lands (`content`); the leading-comma /
-        // keyword skeleton is then shared with every other clause.
-        let items: Vec<String> = assignments
+        // keyword skeleton is then shared with every other clause. A value
+        // holding a block runs onto the lines below, closing at `content`.
+        let items: Vec<Vec<String>> = assignments
             .iter()
             .zip(&targets)
             .map(|(a, t)| {
                 let mut s = t.clone();
                 pad_to(&mut s, eq_col - content);
                 s.push_str("= ");
-                s.push_str(&self.inline(&a.value));
-                s
+                self.value_lines(s, &a.value, content, indent)
             })
             .collect();
-        out.extend(comma_rows(lead, &items, kw_ci, indent, content, ""));
+        out.extend(comma_block_rows(lead, &items, kw_ci, indent, content, ""));
     }
 
     // ---------- INSERT / UPDATE / DELETE ----------
 
-    /// Render a `VALUES` keyword at `kw_ci` followed by each row as a hugging
-    /// leading-comma block at `body`. Shared by INSERT and MERGE's INSERT
-    /// action, which lay out value rows identically.
+    /// Render a `VALUES` keyword at `kw_ci` followed by its rows at `body`.
+    /// A single row is a hugging leading-comma block, one value per line.
+    /// Several rows put each row on one line, in a leading-comma list. Either
+    /// way, a value holding a block expands it, closing at the value's column.
+    /// Shared by INSERT, MERGE's INSERT action, and a VALUES query.
     fn values_rows(&self, v: &Values, kw_ci: usize, body: usize, out: &mut Vec<String>) {
         out.push(format!("{}VALUES", pad(kw_ci)));
-        for row in &v.rows {
-            let vals: Vec<String> = row.content.iter().map(|e| self.inline(e)).collect();
-            self.leading_comma_block(&vals, body, out);
+        let content = body + 1;
+        match v.rows.as_slice() {
+            [row] => {
+                let vals: Vec<Vec<String>> = row
+                    .content
+                    .iter()
+                    .map(|e| self.value_lines(String::new(), e, content, body))
+                    .collect();
+                out.extend(comma_block_rows("(", &vals, body, body, content, ")"));
+            }
+            rows => {
+                let rows: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|row| {
+                        let texts: Vec<String> =
+                            row.content.iter().map(|e| self.inline(e)).collect();
+                        let exprs: Vec<Option<&Expr>> = row.content.iter().map(Some).collect();
+                        match self.split_list("(", &texts, &exprs) {
+                            Some(split) => {
+                                let mut lines = Vec::new();
+                                let mut line = String::new();
+                                self.render_split(
+                                    split,
+                                    &mut line,
+                                    &mut lines,
+                                    content,
+                                    body,
+                                    Alias::NONE,
+                                );
+                                lines
+                            }
+                            None => vec![format!("({})", texts.join(", "))],
+                        }
+                    })
+                    .collect();
+                out.extend(comma_block_rows("", &rows, body, body, content, ""));
+            }
         }
     }
 
@@ -1008,14 +1368,23 @@ impl Fmt {
         } else {
             "INSERT"
         };
+        let mut kw = kw.to_string();
+        if let Some(or) = &ins.or {
+            kw.push(' ');
+            kw.push_str(&or.to_string());
+        }
+        if ins.ignore {
+            kw.push_str(" IGNORE");
+        }
         let into = if ins.into { " INTO" } else { "" };
         let table = match &ins.table {
             TableObject::TableName(name) => self.post(&name.to_string()),
             other => self.post(&other.to_string()),
         };
         let mut head = format!("{}{}{} {}", pad(ci), kw, into, table);
+        // PostgreSQL requires the AS here, unlike a FROM alias.
         if let Some(alias) = &ins.table_alias {
-            head.push(' ');
+            head.push_str(" AS ");
             head.push_str(&alias.alias.to_string());
         }
         out.push(head);
@@ -1030,13 +1399,63 @@ impl Fmt {
             self.leading_comma_block(&cols, body, &mut out);
         }
 
-        if let Some(src) = &ins.source {
-            if let SetExpr::Values(v) = src.body.as_ref() {
-                self.values_rows(v, ci, body, &mut out);
-            } else {
-                // INSERT ... SELECT
-                out.extend(self.query(src, ci));
+        match &ins.source {
+            Some(src) => {
+                if let SetExpr::Values(v) = src.body.as_ref() {
+                    self.values_rows(v, ci, body, &mut out);
+                } else {
+                    // INSERT ... SELECT
+                    out.extend(self.query(src, ci));
+                }
             }
+            None if !ins.assignments.is_empty() => {
+                self.assignment_list(&ins.assignments, "SET", ci, ci + 8, &mut out);
+            }
+            None => out.push(format!("{}DEFAULT VALUES", pad(ci))),
+        }
+
+        match &ins.on {
+            Some(OnInsert::OnConflict(oc)) => {
+                let mut head = format!("{}ON CONFLICT", pad(ci));
+                match &oc.conflict_target {
+                    Some(ConflictTarget::Columns(cols)) => {
+                        let list: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                        head.push_str(&format!(" ({})", list.join(", ")));
+                    }
+                    Some(other) => {
+                        head.push(' ');
+                        head.push_str(other.to_string().trim());
+                    }
+                    None => {}
+                }
+                match &oc.action {
+                    OnConflictAction::DoNothing => {
+                        head.push_str(" DO NOTHING");
+                        out.push(head);
+                    }
+                    // Laid out like MERGE's WHEN ... THEN UPDATE SET: the
+                    // action one tabstop in, its assignments one more.
+                    OnConflictAction::DoUpdate(du) => {
+                        head.push_str(" DO");
+                        out.push(head);
+                        out.push(format!("{}UPDATE SET", pad(ci + 4)));
+                        self.assignment_list(&du.assignments, "", 0, ci + 8, &mut out);
+                        if let Some(sel) = &du.selection {
+                            out.extend(self.river("WHERE", sel, ci + 4));
+                        }
+                    }
+                }
+            }
+            Some(other) => out.push(format!(
+                "{}{}",
+                pad(ci),
+                self.post(other.to_string().trim())
+            )),
+            None => {}
+        }
+
+        if let Some(items) = &ins.returning {
+            out.extend(self.returning(items, ci));
         }
         out
     }
@@ -1078,6 +1497,9 @@ impl Fmt {
         if let Some(sel) = &u.selection {
             out.extend(self.river("WHERE", sel, ci));
         }
+        if let Some(items) = &u.returning {
+            out.extend(self.returning(items, ci));
+        }
         out
     }
 
@@ -1092,6 +1514,7 @@ impl Fmt {
     ) {
         for (ti, twj) in tables.iter().enumerate() {
             let kw = if ti == 0 { lead } else { "," }.to_string();
+            let kw = with_lateral(kw, &twj.relation);
             let s = twj.relation.span();
             descs.push(RelationDesc {
                 kw,
@@ -1102,6 +1525,7 @@ impl Fmt {
             });
             for join in &twj.joins {
                 let (kw, on) = self.join_parts(join);
+                let kw = with_lateral(kw, &join.relation);
                 let s = join.span();
                 descs.push(RelationDesc {
                     kw,
@@ -1121,11 +1545,20 @@ impl Fmt {
         let tables = match &d.from {
             FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
         };
-        if !tables.is_empty() {
-            out.extend(self.from(tables, ci));
+        // FROM and USING form one relation group, so their aliases align.
+        let mut descs = Vec::new();
+        self.push_relation_descs("FROM", tables, &mut descs);
+        if let Some(using) = &d.using {
+            self.push_relation_descs("USING", using, &mut descs);
+        }
+        if !descs.is_empty() {
+            out.extend(self.render_rows(descs, ci));
         }
         if let Some(sel) = &d.selection {
             out.extend(self.river("WHERE", sel, ci));
+        }
+        if let Some(items) = &d.returning {
+            out.extend(self.returning(items, ci));
         }
         out
     }
@@ -1164,11 +1597,101 @@ impl Fmt {
 
 // ---------- standalone helpers ----------
 
+/// Something that lays out over several lines inside an expression.
+#[derive(Clone, Copy)]
 enum Block<'e> {
-    Subquery(&'e Query),
-    Exists(&'e Query, bool),
-    Window(&'e sqlparser::ast::Function),
+    Query(&'e Query),
+    Window(&'e sqlparser::ast::WindowSpec),
     Case(&'e Expr),
+    /// The arguments of a call, one per line.
+    Args(&'e [FunctionArg]),
+}
+
+impl Block<'_> {
+    /// The text that ends the block on its closing line.
+    fn close(&self) -> &'static str {
+        match self {
+            Block::Query(_) | Block::Window(_) | Block::Args(_) => ")",
+            Block::Case(_) => "END",
+        }
+    }
+}
+
+/// An expression around a block: the inline text before the block on its
+/// opening line, and the inline text after it on its closing line.
+struct Split<'e> {
+    head: String,
+    block: Block<'e>,
+    tail: String,
+}
+
+impl<'e> Split<'e> {
+    fn bare(block: Block<'e>) -> Self {
+        Split {
+            head: String::new(),
+            block,
+            tail: String::new(),
+        }
+    }
+
+    /// The same block with more inline text around it.
+    fn wrap(self, head: String, tail: &str) -> Self {
+        Split {
+            head: head + &self.head,
+            block: self.block,
+            tail: self.tail + tail,
+        }
+    }
+}
+
+/// Whether a subquery is short enough to stay inline: one item from at most
+/// one table and nothing else, so expanding it would only give two lines.
+fn is_short(q: &Query) -> bool {
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        return false;
+    };
+    let no_group_by = match &s.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => exprs.is_empty() && modifiers.is_empty(),
+        GroupByExpr::All(_) => false,
+    };
+    q.with.is_none()
+        && q.order_by.is_none()
+        && q.limit_clause.is_none()
+        && q.fetch.is_none()
+        && q.locks.is_empty()
+        && s.distinct.is_none()
+        && s.into.is_none()
+        && s.projection.len() == 1
+        && s.from.len() <= 1
+        && s.from.iter().all(|t| t.joins.is_empty())
+        && s.selection.is_none()
+        && no_group_by
+        && s.having.is_none()
+        && s.qualify.is_none()
+        && s.named_window.is_empty()
+}
+
+/// The expression of a plain positional argument.
+fn unnamed_expr(arg: &FunctionArg) -> Option<&Expr> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+        _ => None,
+    }
+}
+
+/// The arguments of a plain call like `COALESCE(x, 0)`, or `None` for anything
+/// more (DISTINCT, FILTER, OVER, an ORDER BY inside the parens).
+fn plain_args(f: &sqlparser::ast::Function) -> Option<&[FunctionArg]> {
+    if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
+        return None;
+    }
+    let FunctionArguments::List(list) = &f.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    Some(&list.args)
 }
 
 /// A trailing `AS <name>` alias to render, with the columns it snaps to. A
@@ -1210,6 +1733,8 @@ struct RelationDesc<'a> {
 
 /// The shared grid columns resolved for a relation group.
 struct RowCols {
+    /// Where a comma-separated table's leading comma goes.
+    comma_col: usize,
     table_col: usize,
     alias_col: usize,
     on_col: usize,
@@ -1234,14 +1759,73 @@ enum OnClause {
     Using(String),
 }
 
+/// A table alias as it appears in a relation's alias column: the name, plus
+/// its column list when it has one. The `AS` is left off, as everywhere else.
+fn alias_text(a: &TableAlias) -> String {
+    if a.columns.is_empty() {
+        return a.name.to_string();
+    }
+    let cols: Vec<String> = a.columns.iter().map(|c| c.to_string()).collect();
+    format!("{} ({})", a.name, cols.join(", "))
+}
+
+/// A `LATERAL` derived table says so as part of its keyword (`CROSS JOIN
+/// LATERAL`), so the whole phrase sits in the keyword column.
+fn with_lateral(kw: String, factor: &TableFactor) -> String {
+    match factor {
+        TableFactor::Derived { lateral: true, .. } => format!("{kw} LATERAL"),
+        _ => kw,
+    }
+}
+
+/// A relation's alias cell: the alias, then any TABLESAMPLE on the next
+/// tabstop (or in the alias's place when there's no alias).
+fn alias_cell(alias: Option<&TableAlias>, sample: Option<String>) -> Option<String> {
+    let sample = sample.map(|s| s.trim().to_string());
+    match (alias.map(alias_text), sample) {
+        (Some(mut cell), Some(sample)) => {
+            // The alias column sits on a tabstop, so this snaps to one too.
+            let col = align_after(cell.chars().count() - 1);
+            pad_to(&mut cell, col);
+            cell.push_str(&sample);
+            Some(cell)
+        }
+        (cell, None) => cell,
+        (None, sample) => sample,
+    }
+}
+
+/// A TABLESAMPLE clause, wherever it was written.
+fn sample_text(kind: &TableSampleKind) -> String {
+    match kind {
+        TableSampleKind::BeforeTableAlias(s) | TableSampleKind::AfterTableAlias(s) => s.to_string(),
+    }
+}
+
+/// Whether a window spec expands into a block rather than staying inline:
+/// anything but a bare `OVER ()` or `OVER (name)`.
+fn expands(spec: &sqlparser::ast::WindowSpec) -> bool {
+    !spec.partition_by.is_empty() || !spec.order_by.is_empty() || spec.window_frame.is_some()
+}
+
+/// A one-line clause: `kw` at `ci`, `value` on the clause grid after it.
+fn clause_line(kw: &str, value: &str, ci: usize) -> String {
+    clause_line_at(kw, value, ci, align_after(ci + kw.len() - 1))
+}
+
+/// A one-line clause with `value` at an explicit `grid` column.
+fn clause_line_at(kw: &str, value: &str, ci: usize, grid: usize) -> String {
+    let mut line = format!("{}{}", pad(ci), kw);
+    if !value.is_empty() {
+        pad_to(&mut line, grid);
+        line.push_str(value);
+    }
+    line
+}
+
 /// Round up to the next multiple of 4.
 fn ceil4(n: usize) -> usize {
     n.div_ceil(4) * 4
-}
-
-/// Round down to the nearest multiple of 4 (the enclosing tabstop).
-fn floor4(n: usize) -> usize {
-    n / 4 * 4
 }
 
 /// Given the column index of the last character of the widest token in the
@@ -1284,10 +1868,24 @@ fn comma_rows(
     content_col: usize,
     close: &str,
 ) -> Vec<String> {
+    let items: Vec<Vec<String>> = items.iter().map(|i| vec![i.clone()]).collect();
+    comma_block_rows(lead, &items, ci, comma_col, content_col, close)
+}
+
+/// `comma_rows` for items that may span several lines: an item's first line
+/// is placed like a one-line item, and the rest (already laid out at their
+/// own columns) follow as they are.
+fn comma_block_rows(
+    lead: &str,
+    items: &[Vec<String>],
+    ci: usize,
+    comma_col: usize,
+    content_col: usize,
+    close: &str,
+) -> Vec<String> {
     if items.is_empty() {
         return vec![format!("{}{}{}", pad(ci), lead, close)];
     }
-    let last = items.len() - 1;
     let mut out = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let mut l = if i == 0 {
@@ -1299,11 +1897,12 @@ fn comma_rows(
             l.push(',');
             l
         };
-        l.push_str(item);
-        if i == last {
-            l.push_str(close);
-        }
+        l.push_str(&item[0]);
         out.push(l);
+        out.extend(item[1..].iter().cloned());
+    }
+    if let Some(last) = out.last_mut() {
+        last.push_str(close);
     }
     out
 }
@@ -1362,6 +1961,24 @@ fn collect_chain<'e>(e: &'e Expr, target: &BinaryOperator, out: &mut Vec<&'e Exp
         }
     }
     out.push(e);
+}
+
+/// Whether the last query of a set-operation operand is parenthesized.
+fn ends_in_parens(e: &SetExpr) -> bool {
+    match e {
+        SetExpr::Query(_) => true,
+        SetExpr::SetOperation { right, .. } => ends_in_parens(right),
+        _ => false,
+    }
+}
+
+/// Whether the first query of a set-operation operand is parenthesized.
+fn starts_in_parens(e: &SetExpr) -> bool {
+    match e {
+        SetExpr::Query(_) => true,
+        SetExpr::SetOperation { left, .. } => starts_in_parens(left),
+        _ => false,
+    }
 }
 
 fn set_op_str(op: &SetOperator, q: &SetQuantifier) -> String {

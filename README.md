@@ -10,8 +10,8 @@ with [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs)
 (PostgreSQL dialect) and applies its own layout.
 
 It gives the full treatment to `SELECT` / `WITH`, `MERGE`, `INSERT`, `UPDATE`,
-and `DELETE`. Other statement kinds (DDL, etc.) are passed through as compact
-single-line SQL.
+and `DELETE`, and to the query inside `CREATE TABLE ... AS` and `CREATE VIEW`.
+Other statement kinds (DDL, etc.) are passed through as compact single-line SQL.
 
 ## Usage
 
@@ -37,6 +37,11 @@ Any statement that can't be parsed (e.g. a SQLMesh `MODEL (...)` block) is
 passed through **unchanged** with a warning on stderr — so a SQLMesh model file
 gets its query formatted while the `MODEL` block is left intact, and the tool
 never garbles SQL it doesn't understand. Exit code is 0.
+
+The same goes for a statement the layout can't fully represent. Each formatted
+statement is parsed again and compared with the original; if anything was lost
+(a clause the formatter has no place for, such as MySQL's `DELETE ... LIMIT`),
+the statement is left exactly as written, with a warning, rather than changed.
 
 With `mise`:
 
@@ -136,7 +141,10 @@ ORDER BY 1, 2
   align on the same grid — their value "ends" at the closing `)` (or `END`).
 - **FROM and its JOINs** form one alignment group: table names, aliases, `ON`,
   and the join condition each get their own grid column; trailing `AND`/`OR`
-  align under `ON`. `LEFT JOIN` (etc.) widens the group, pushing tables out.
+  align under `ON`. `LEFT JOIN` (etc.) widens the group, pushing tables out, and
+  so does `LATERAL`, which joins the keyword (`CROSS JOIN LATERAL`).
+  Comma-separated tables take leading commas like a SELECT list. `TABLESAMPLE`
+  follows the alias on the next tabstop, or takes its column when there's none.
 - **WHERE / HAVING** put the keyword in the gutter and flow predicates in the
   river, with `AND`/`OR` on the river. A parenthesized `AND`/`OR` operand
   expands into a nested sub-river: `(` opens at the operand tabstop, the inner
@@ -145,8 +153,17 @@ ORDER BY 1, 2
   (`ORDER BY 1, 2`); as soon as a column *name* appears they break to one item
   per line with leading commas.
 - **Window functions** expand `OVER (...)` into an aligned `PARTITION BY` /
-  `ORDER BY` block.
-- **Subqueries / `EXISTS`** in the SELECT list become indented blocks.
+  `ORDER BY` block, with a frame's `ROWS` / `RANGE` / `GROUPS` in the keyword
+  column and a base window's name on the first line. The `WINDOW` clause lays
+  each definition out the same way.
+- **Subqueries, windows, and `CASE`** expand into indented blocks wherever they
+  sit: a SELECT item, a `WHERE` operand (`total = (`, `id IN (`, `EXISTS (`), a
+  `SET` or `VALUES` value, the lone argument of a call (`SUM(CASE`), and so on,
+  recursively. The text around the block stays inline on its opening and closing
+  lines (`END) > 0`, `) = 1`). A call with several arguments, one of them
+  holding a block, puts one argument per line, a tabstop in with leading commas,
+  and closes its `)` back at the call's column. A short subquery, one item from at most one table and
+  nothing else, stays inline: `(SELECT MAX(id) FROM s)`.
 - **Derived tables** (subqueries in `FROM`/`JOIN`) put the keyword alone on its
   line; `(` drops to the next line at the keyword's indent, the body indents one
   level past that, and `)` returns to the keyword's indent and carries the alias
@@ -155,19 +172,28 @@ ORDER BY 1, 2
 - **`CASE`** expands to a block: `WHEN`/`ELSE` indent one tabstop in from the
   value column's tabstop, and `END` returns to the value column so it lines up
   with `CASE`.
+- **Set operations** put a blank line between each query and the operator. A
+  parenthesized query keeps its parentheses, laid out like a derived table, and
+  needs no blank line on that side.
+- **`CREATE TABLE ... AS` / `CREATE VIEW ... AS`** keep everything before `AS`
+  on one line, put `AS` on its own line, and lay out the query below it.
 
 ### MERGE / INSERT / UPDATE / DELETE
 
 The DML statements reuse the same building blocks (the FROM/JOIN grid, the WHERE
 river, leading-comma lists). Parenthesized column / `VALUES` lists "hug": `(`
 glues to the first item, `)` to the last, with leading commas under the `(`.
+A single `VALUES` row gets one value per line; several rows get one row per line
+in a leading-comma list. `RETURNING` sits alone on its line with its items one
+tabstop in, and `ON CONFLICT ... DO UPDATE` lays out like a `MERGE` action. A
+lone `SET` assignment drops the leading-comma column and the `=` alignment.
 
 ```sql
 MERGE
 INTO    warehouse.inventory t
 USING
 (
-    SELECT   sku
+    SELECT   sku        AS  sku
             ,SUM(qty)   AS  qty
     FROM    staging.receipts
     GROUP BY sku

@@ -1,4 +1,4 @@
-SELECT   o.id
+SELECT   o.id   AS  id
         ,c.name AS  customer
         ,p.name AS  product
         ,s.name AS  status

@@ -1,6 +1,6 @@
 -- Customers and their order counts.
-SELECT   c.id
-        ,c.email  -- contact address
+SELECT   c.id           AS  id
+        ,c.email        AS  email  -- contact address
         -- only counts non-cancelled orders
         ,COUNT(o.id)    AS  order_count
 FROM        customers   c

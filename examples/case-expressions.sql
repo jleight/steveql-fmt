@@ -1,5 +1,5 @@
-SELECT   id
-        ,amount
+SELECT   id     AS  id
+        ,amount AS  amount
         ,CASE
             WHEN amount >= 1000 THEN 'large'
             WHEN amount >= 100 THEN 'medium'

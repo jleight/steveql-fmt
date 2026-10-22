@@ -3,14 +3,16 @@ WITH RECURSIVE descendants AS (
                 ,parent_id
         FROM    categories
         WHERE   parent_id IS NULL
+
         UNION ALL
+
         SELECT   c.id
                 ,c.parent_id
         FROM    categories  c
         JOIN    descendants d   ON  c.parent_id = d.id
     )
     ,counts AS (
-        SELECT   parent_id
+        SELECT   parent_id  AS  parent_id
                 ,COUNT(*)   AS  n
         FROM    descendants
         GROUP BY 1

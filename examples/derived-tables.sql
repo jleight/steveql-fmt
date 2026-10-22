@@ -2,7 +2,7 @@ SELECT   t.region
         ,t.total
 FROM
 (
-    SELECT   region
+    SELECT   region         AS  region
             ,SUM(amount)    AS  total
     FROM    sales
     WHERE   amount > 0
@@ -10,7 +10,7 @@ FROM
 )   t
 JOIN
 (
-    SELECT   region
+    SELECT   region     AS  region
             ,COUNT(*)   AS  n
     FROM    stores
     GROUP BY region

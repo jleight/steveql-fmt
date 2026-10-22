@@ -6,7 +6,7 @@ MODEL (
   grain order_date,
 );
 
-SELECT   order_date
+SELECT   order_date     AS  order_date
         ,COUNT(*)       AS  orders
         ,SUM(amount)    AS  revenue
 FROM    orders

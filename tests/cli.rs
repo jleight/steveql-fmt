@@ -59,6 +59,54 @@ fn examples_are_already_formatted() {
     }
 }
 
+/// Format `input` via stdin and return stderr.
+fn warnings(input: &str) -> String {
+    let mut child = Command::new(BIN)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait");
+    String::from_utf8(out.stderr).unwrap()
+}
+
+/// The formatter refuses any layout that would parse back to a different
+/// query, so an example that trips that check is one whose layout drops
+/// something, even when the file looks right.
+#[test]
+fn examples_keep_their_meaning() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
+    for entry in std::fs::read_dir(dir).expect("read examples/") {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|x| x != "sql") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let stderr = warnings(&content);
+        assert!(
+            !stderr.contains("changed what it means"),
+            "{}: {stderr}",
+            path.file_name().unwrap().to_string_lossy()
+        );
+    }
+}
+
+#[test]
+fn statement_it_cannot_lay_out_is_left_as_written() {
+    // DELETE ... ORDER BY ... LIMIT parses, but the layout has no place for
+    // the ORDER BY or LIMIT, so the statement is left exactly as written.
+    let input = "delete from t where a = 1 order by b limit 1;\n";
+    assert_eq!(format(input), input);
+    assert!(warnings(input).contains("changed what it means"));
+}
+
 #[test]
 fn uppercases_keywords_and_standard_functions() {
     let out = format("select count(*), pg_table_size(oid) from t where x = true");

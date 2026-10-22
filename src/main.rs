@@ -8,8 +8,10 @@ mod lsp;
 mod scan;
 
 use std::io::{Read, Write};
+use std::ops::ControlFlow;
 use std::process::ExitCode;
 
+use sqlparser::ast::{Statement, TableFactor, VisitMut, VisitorMut};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
@@ -161,12 +163,13 @@ pub(crate) fn format_sql(input: &str) -> (String, Option<String>) {
             errors.join("; ")
         )
     });
+
     (body, warning)
 }
 
 /// Format a single statement chunk. Returns the formatted text (no trailing
-/// newline or semicolon) and, if it couldn't be parsed, the parse error (the
-/// chunk is then passed through verbatim).
+/// newline or semicolon) and, if it couldn't be parsed or formatting it would
+/// change what it means, why (the chunk is then passed through verbatim).
 fn format_statement(chunk: &str) -> (String, Option<String>) {
     let trimmed = chunk.trim();
     let (prepared, placeholders) = swap_placeholders(trimmed);
@@ -180,15 +183,59 @@ fn format_statement(chunk: &str) -> (String, Option<String>) {
                 .collect::<Vec<_>>()
                 .join("\n\n");
             // Restore not-equal spellings (and add 🤮 for `<>`) in source order.
-            (
-                format::voice_not_equal(&body, &scan_not_equals(trimmed)),
-                None,
-            )
+            let formatted = format::voice_not_equal(&body, &scan_not_equals(trimmed));
+            // The layout is rebuilt from the parts of the AST the formatter
+            // knows about, so anything it doesn't know would vanish. Re-parse
+            // the result and refuse it unless it says the same thing.
+            if !same_meaning(statements, &formatted) {
+                return (
+                    trimmed.to_string(),
+                    Some("formatting it would have changed what it means".to_string()),
+                );
+            }
+            (formatted, None)
         }
         // Empty parse (e.g. a comment-only chunk) — pass through, no error.
         Ok(_) => (trimmed.to_string(), None),
         Err(e) => (trimmed.to_string(), Some(e.to_string())),
     }
+}
+
+/// Whether `formatted` parses to the same statements as `original`, ignoring
+/// the differences the style introduces on purpose.
+fn same_meaning(original: Vec<Statement>, formatted: &str) -> bool {
+    let (prepared, _) = swap_placeholders(formatted);
+    match Parser::parse_sql(&PostgreSqlDialect {}, &prepared) {
+        Ok(reparsed) => canonical(original) == canonical(reparsed),
+        Err(_) => false,
+    }
+}
+
+/// Render statements for comparison, normalizing what the style rewrites
+/// without changing meaning: keyword and function-name case, `AS` before a
+/// table alias, and `INNER` / `OUTER` in join keywords.
+fn canonical(mut statements: Vec<Statement>) -> String {
+    struct DropAliasAs;
+    impl VisitorMut for DropAliasAs {
+        type Break = ();
+        fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+            if let TableFactor::Table { alias: Some(a), .. }
+            | TableFactor::Derived { alias: Some(a), .. } = factor
+            {
+                a.explicit = false;
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let _ = statements.visit(&mut DropAliasAs);
+    statements
+        .iter()
+        .map(|s| s.to_string().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(";\n")
+        .replace(" inner join ", " join ")
+        .replace(" left outer join ", " left join ")
+        .replace(" right outer join ", " right join ")
 }
 
 /// Collect comments from the source with their line numbers, flagging those

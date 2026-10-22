@@ -2,7 +2,7 @@ MERGE
 INTO    warehouse.inventory t
 USING
 (
-    SELECT   sku
+    SELECT   sku        AS  sku
             ,SUM(qty)   AS  qty
     FROM    staging.receipts
     GROUP BY sku
