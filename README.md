@@ -10,8 +10,9 @@ with [`sqlparser`](https://github.com/apache/datafusion-sqlparser-rs)
 (PostgreSQL dialect) and applies its own layout.
 
 It gives the full treatment to `SELECT` / `WITH`, `MERGE`, `INSERT`, `UPDATE`,
-and `DELETE`, and to the query inside `CREATE TABLE ... AS` and `CREATE VIEW`.
-Other statement kinds (DDL, etc.) are passed through as compact single-line SQL.
+`DELETE`, `CREATE TABLE`, `ALTER TABLE`, and DuckDB's `CREATE SECRET`, and to the
+query inside `CREATE TABLE ... AS` and `CREATE VIEW`. Other statement kinds are
+passed through as compact single-line SQL.
 
 ## Usage
 
@@ -247,6 +248,32 @@ WHERE   "is_released" <> TRUE  -- 🤮
   leads the assignment list, with `=` aligned to the tabstop past the widest
   target.
 - **DELETE:** `DELETE` on its own line, the target laid out like a `FROM`.
+
+### CREATE TABLE / ALTER TABLE / CREATE SECRET
+
+Each item lines up its parts on the grid: a column's name, type, nullability,
+and constraints; an `ALTER TABLE` action's keyword, the object it acts on, and
+the rest; a secret option's name and value. When the last part holds several
+clauses, they stack one per line, each under the first, the way `AND` lines up
+under `ON`. `CREATE TABLE` and `CREATE SECRET` open `(` on the header line and
+close `)` alone, and table constraints follow the columns after a blank line.
+`ALTER TABLE` lists its actions below the header with leading commas.
+
+```sql
+CREATE TABLE IF NOT EXISTS billing.order_lines (
+     order_id   BIGINT          NOT NULL    REFERENCES billing.orders (id)
+                                            ON DELETE CASCADE
+    ,line_no    INTEGER         NOT NULL
+    ,unit_price NUMERIC(12, 2)  NOT NULL    CHECK (unit_price >= 0)
+
+    ,PRIMARY KEY (order_id, line_no)
+);
+
+ALTER TABLE IF EXISTS billing.orders
+     DROP COLUMN    legacy_code CASCADE
+    ,ALTER COLUMN   total       SET DATA TYPE BIGINT
+    ,ALTER COLUMN   status      SET NOT NULL
+```
 
 ## Casing
 

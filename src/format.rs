@@ -7,6 +7,8 @@
 //! laid out by hand on a 4-column alignment grid.
 
 use crate::funcs;
+
+mod ddl;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Cte, Delete, Distinct, Expr,
     FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, Join,
@@ -73,6 +75,22 @@ impl Fmt {
                 out.extend(self.query_after_header(stmt, ct.query.as_ref().unwrap()))
             }
             Statement::CreateView(cv) => out.extend(self.query_after_header(stmt, &cv.query)),
+            Statement::CreateTable(ct) => match self.create_table(ct) {
+                Some(lines) => out.extend(lines),
+                None => out.push(self.post(&stmt.to_string())),
+            },
+            Statement::CreateSecret {
+                secret_type,
+                options,
+                ..
+            } => match self.create_secret(stmt, secret_type, options) {
+                Some(lines) => out.extend(lines),
+                None => out.push(self.post(&stmt.to_string())),
+            },
+            Statement::AlterTable(at) => match self.alter_table(at) {
+                Some(lines) => out.extend(lines),
+                None => out.push(self.post(&stmt.to_string())),
+            },
             // Anything we don't lay out by hand falls back to compact SQL.
             other => out.push(self.post(&other.to_string())),
         }
