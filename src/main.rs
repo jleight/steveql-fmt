@@ -17,7 +17,9 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use format::Comment;
-use scan::{scan_not_equals, split_statements, swap_lock_strengths, swap_placeholders};
+use scan::{
+    has_ignore_directive, scan_not_equals, split_statements, swap_lock_strengths, swap_placeholders,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -169,9 +171,14 @@ pub(crate) fn format_sql(input: &str) -> (String, Option<String>) {
 
 /// Format a single statement chunk. Returns the formatted text (no trailing
 /// newline or semicolon) and, if it couldn't be parsed or formatting it would
-/// change what it means, why (the chunk is then passed through verbatim).
+/// change what it means, why (the chunk is then passed through verbatim). A
+/// statement under `-- steveql-fmt: ignore` is passed through without a
+/// warning.
 fn format_statement(chunk: &str) -> (String, Option<String>) {
     let trimmed = chunk.trim();
+    if has_ignore_directive(trimmed) {
+        return (trimmed.to_string(), None);
+    }
     let (prepared, placeholders, keyed_locks) = prepare(trimmed);
 
     match Parser::parse_sql(&PostgreSqlDialect {}, &prepared) {

@@ -1,3 +1,4 @@
+-- steveql-fmt: ignore
 MODEL (
   name analytics.daily_orders,
   kind INCREMENTAL_BY_TIME_RANGE (

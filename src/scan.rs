@@ -267,6 +267,23 @@ pub fn swap_placeholders(src: &str) -> (String, Vec<String>) {
     (out, originals)
 }
 
+/// The comment that, directly above a statement, leaves it as written.
+pub const IGNORE_DIRECTIVE: &str = "-- steveql-fmt: ignore";
+
+/// Whether the comments leading a statement chunk, before any of its code,
+/// include [`IGNORE_DIRECTIVE`].
+pub fn has_ignore_directive(chunk: &str) -> bool {
+    for c in Scanner::new(chunk) {
+        match c.kind {
+            ChunkKind::LineComment if c.text.trim_end() == IGNORE_DIRECTIVE => return true,
+            ChunkKind::LineComment | ChunkKind::BlockComment => {}
+            ChunkKind::Code if c.text.trim().is_empty() => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Rewrite Postgres's `FOR NO KEY UPDATE` and `FOR KEY SHARE` locks, which
 /// sqlparser can't parse, to `FOR UPDATE` and `FOR SHARE`. Returns the
 /// rewritten SQL and, for every lock clause in order, whether it was one of
@@ -493,6 +510,15 @@ mod tests {
         let (out, originals) = swap_placeholders("a % 2");
         assert_eq!(out, "a % 2");
         assert!(originals.is_empty());
+    }
+
+    #[test]
+    fn ignore_directive_only_counts_before_code() {
+        assert!(has_ignore_directive(
+            "-- header\n-- steveql-fmt: ignore\nMODEL (x)"
+        ));
+        assert!(!has_ignore_directive("select 1 -- steveql-fmt: ignore\n"));
+        assert!(!has_ignore_directive("-- steveql-fmt: ignored\nselect 1"));
     }
 
     #[test]

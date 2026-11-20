@@ -44,6 +44,16 @@ statement is parsed again and compared with the original; if anything was lost
 (a clause the formatter has no place for, such as MySQL's `DELETE ... LIMIT`),
 the statement is left exactly as written, with a warning, rather than changed.
 
+To leave a statement as written on purpose, without the warning, put a
+`-- steveql-fmt: ignore` line among the comments directly above it:
+
+```sql
+-- steveql-fmt: ignore
+MODEL (
+  name analytics.daily_orders
+);
+```
+
 With `mise`:
 
 ```sh
@@ -291,8 +301,8 @@ ALTER TABLE IF EXISTS billing.orders
 
 ## Placeholders
 
-psycopg-style placeholders (`%s`, `%(name)s`) are not valid SQL, so they are
-swapped for parser-safe tokens before parsing and restored verbatim in the
+psycopg-style placeholders (`%s`, `%(name)s`) are not valid SQL, and sqlc and
+SQLMesh's `@name` reads as Postgres's `@` operator, so they are swapped for parser-safe tokens before parsing and restored verbatim in the
 output.
 
 ## Comments

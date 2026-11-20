@@ -28,11 +28,8 @@ fn format(input: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// Every file in `examples/` is already in canonical form, so formatting it is a
-/// no-op. This both documents the style and guarantees the formatter is a
-/// fixpoint (idempotent) over the whole showcase.
-#[test]
-fn examples_are_already_formatted() {
+/// The `.sql` files in `examples/`, sorted, with each one's name and contents.
+fn examples() -> Vec<(String, String)> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
     let mut paths: Vec<_> = std::fs::read_dir(dir)
         .expect("read examples/")
@@ -47,15 +44,22 @@ fn examples_are_already_formatted() {
         .collect();
     paths.sort();
     assert!(!paths.is_empty(), "no example files found");
+    paths
+        .into_iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            (name, std::fs::read_to_string(&p).unwrap())
+        })
+        .collect()
+}
 
-    for path in paths {
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            format(&content),
-            content,
-            "{} is not in canonical form",
-            path.file_name().unwrap().to_string_lossy()
-        );
+/// Every file in `examples/` is already in canonical form, so formatting it is a
+/// no-op. This both documents the style and guarantees the formatter is a
+/// fixpoint (idempotent) over the whole showcase.
+#[test]
+fn examples_are_already_formatted() {
+    for (name, content) in examples() {
+        assert_eq!(format(&content), content, "{name} is not in canonical form");
     }
 }
 
@@ -77,24 +81,16 @@ fn warnings(input: &str) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
-/// The formatter refuses any layout that would parse back to a different
-/// query, so an example that trips that check is one whose layout drops
-/// something, even when the file looks right.
+/// An example the formatter warns about was passed through instead of
+/// formatted, so it would pass `examples_are_already_formatted` without
+/// testing anything: either it doesn't parse, or its layout would change what
+/// it means (dropping something, even when the file looks right). A statement
+/// meant to pass through goes under `-- steveql-fmt: ignore`.
 #[test]
-fn examples_keep_their_meaning() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/examples");
-    for entry in std::fs::read_dir(dir).expect("read examples/") {
-        let path = entry.unwrap().path();
-        if path.extension().is_none_or(|x| x != "sql") {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path).unwrap();
+fn examples_format_without_warnings() {
+    for (name, content) in examples() {
         let stderr = warnings(&content);
-        assert!(
-            !stderr.contains("changed what it means"),
-            "{}: {stderr}",
-            path.file_name().unwrap().to_string_lossy()
-        );
+        assert!(stderr.is_empty(), "{name}: {stderr}");
     }
 }
 
