@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+jobs:
+  # A tag only publishes once lint and tests pass on its commit, since the
+  # release signs what it builds.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          cache: false
+      - run: mise run lint
+      - name: Check the crate version matches the tag
+        # A prerelease such as v0.1.0-rc.2 expects 0.1.0.
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          want="${want%%-*}"
+          got="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::Cargo.toml says $got, but the tag $GITHUB_REF_NAME needs $want."
+            exit 1
+          fi
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          cache: false
+      - run: mise run test
+
+  release:
+    name: Release
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Create the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # goreleaser needs the tags to find the previous release.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
+        with:
+          # Tag builds can read caches that runs on main wrote, so a poisoned
+          # cache could put files into a signed release.
+          cache: false
+          # Only what this job runs.
+          install_args: rust zig github:rust-cross/cargo-zigbuild github:EmbarkStudios/cargo-about goreleaser
+      - name: Build stable release notes from the last stable release
+        # goreleaser compares against the previous tag, which for a stable release
+        # is usually a release candidate whose notes it would leave out. A stable
+        # release lists everything since the last stable one, or since the first
+        # commit; a prerelease keeps the default.
+        run: |
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            previous="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "${GITHUB_REF_NAME}^" 2>/dev/null || git rev-list --max-parents=0 HEAD)"
+            echo "GORELEASER_PREVIOUS_TAG=$previous" >> "$GITHUB_ENV"
+          fi
+      - name: Release the CLI
+        run: goreleaser release --clean
+        env:
+          # Several tags can point at one commit, such as v0.1.0 and v0.1.0-rc.4,
+          # and goreleaser would otherwise pick one of them itself.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Signs a packslip manifest of the archives, so mise can install and verify
+  # them with packslip:github.com/jleight/steveql-fmt. This job can't change
+  # the release; the next one uploads the signed bundle.
+  packslip:
+    name: Sign the packslip
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Download the release's archives. A draft release is only visible to a
+      # token that can write to the repository.
+      contents: write
+      # Sign with the workflow's identity.
+      id-token: write
+      # Attest the archives' build provenance.
+      attestations: write
+    steps:
+      - uses: jdx/packslip@e0340e0c1d10c90a434de2b90f3a1ba345923564 # v1.11.4
+        id: packslip
+        with:
+          download: steveql-fmt_*.tar.gz
+          bin: steveql-fmt
+          upload: false
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packslip-bundle
+          path: ${{ steps.packslip.outputs.bundle }}
+          if-no-files-found: error
+
+  publish-packslip:
+    name: Publish the packslip
+    needs: packslip
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Upload the bundle to the release and publish it.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packslip-bundle
+          path: packslip
+      - name: Upload the signed bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f packslip/packslip.sigstore.json
+          gh release upload "$GITHUB_REF_NAME" packslip/packslip.sigstore.json --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"

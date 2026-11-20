@@ -1,0 +1,15 @@
+# cargo-about collects the licenses of the crates the binary bundles into
+# THIRD_PARTY_LICENSES.md, which each release archive ships.
+accepted = ["Apache-2.0", "MIT", "Unicode-3.0", "Unlicense"]
+# Build scripts and proc macros run at compile time and aren't bundled.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-gnu",
+]
+# Skip steveql-fmt itself, which publish = false marks.
+private = { ignore = true }

@@ -1,5 +1,9 @@
 [tools]
 rust = "latest"
+goreleaser = "latest"
+zig = "latest"
+"github:rust-cross/cargo-zigbuild" = "latest"
+"github:EmbarkStudios/cargo-about" = "latest"
 
 [tasks.build]
 description = "Compile the project (cargo build)"
@@ -26,8 +30,21 @@ description = "Lint with clippy, denying warnings"
 run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks.lint]
+description = "Check formatting, lint with clippy, and check the release config"
+run = [
+    "cargo fmt --check",
+    "cargo clippy --all-targets -- -D warnings",
+    "goreleaser check",
+]
+
+[tasks.lint-fix]
 description = "Format then lint"
+alias = "fix"
 depends = ["format", "clippy"]
+
+[tasks."release:snapshot"]
+description = "Build the release archives locally without publishing them"
+run = "goreleaser release --snapshot --clean"
 
 [tasks.examples]
 description = "Reformat the example SQL files in place"

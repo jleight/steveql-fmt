@@ -14,6 +14,24 @@ It gives the full treatment to `SELECT` / `WITH`, `MERGE`, `INSERT`, `UPDATE`,
 query inside `CREATE TABLE ... AS` and `CREATE VIEW`. Other statement kinds are
 passed through as compact single-line SQL.
 
+## Installation
+
+Install it with mise:
+
+```sh
+mise use -g packslip:github.com/jleight/steveql-fmt
+```
+
+Each release publishes a [packslip](https://packslip.dev), a signed list of its
+archives and their digests. mise checks that the release was signed by this
+repository's release workflow and that each download matches before it
+installs anything. mise skips releases less than a day old when it resolves
+`latest`, so name the version, as in `@0.1.0`, to install one sooner. The
+archives, for macOS and Linux on x86-64 and ARM64 and Windows on x86-64, are
+also on the [releases](https://github.com/jleight/steveql-fmt/releases) page.
+
+To update, `mise up --bump packslip:github.com/jleight/steveql-fmt`.
+
 ## Usage
 
 ```sh
@@ -61,10 +79,18 @@ mise run build              # cargo build
 mise run run -- query.sql   # cargo run -- query.sql
 mise run format             # cargo fmt
 mise run test               # cargo test
-mise run lint               # format + clippy
+mise run lint               # check formatting, clippy, and the release config
+mise run fix                # format + clippy
 mise run lsp                # run the language server over stdio
 mise run examples           # reformat the example SQL files in place
+mise run release:snapshot   # build the release archives into .cache/dist
 ```
+
+Pushing a `v*` tag publishes a release through
+`.github/workflows/release.yml`. The version in `Cargo.toml` must match the
+tag without any prerelease suffix, or the release stops before publishing, so
+bump it in the commit you tag. The release stays a draft until its signed
+packslip is attached, so mise never sees a release it can't install.
 
 ## Editor integration
 

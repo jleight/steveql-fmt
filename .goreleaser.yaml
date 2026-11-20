@@ -1,0 +1,70 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: steveql-fmt
+dist: .cache/dist
+
+# The binary bundles crates whose licenses ask for their notices to go with
+# it, so each release collects them into THIRD_PARTY_LICENSES.md for the
+# archives.
+before:
+  hooks:
+    - mkdir -p .cache/release
+    - cargo-about generate --fail about.hbs -o .cache/release/THIRD_PARTY_LICENSES.md
+
+builds:
+  - id: steveql-fmt
+    builder: rust
+    binary: steveql-fmt
+    # cargo-zigbuild cross-compiles every target from one Linux runner. The
+    # Linux builds link musl statically, so they run on any distribution.
+    # There's no Windows ARM64 build: zig can't link Rust's gnullvm target,
+    # and Windows on ARM runs the x86-64 build through emulation.
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+      - x86_64-pc-windows-gnu
+    flags:
+      - --release
+      - --locked
+
+# `mise use packslip:github.com/jleight/steveql-fmt` installs these. Windows
+# gets a zip, as Windows users expect.
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - src: .cache/release/THIRD_PARTY_LICENSES.md
+        dst: THIRD_PARTY_LICENSES.md
+        info:
+          mode: 0o644
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+# Commits go straight to main, so the notes come from commit subjects rather
+# than merged pull requests.
+changelog:
+  use: git
+  abbrev: 7
+
+release:
+  github:
+    owner: jleight
+    name: steveql-fmt
+  prerelease: auto
+  # The workflow publishes the draft once its signed packslip is attached,
+  # so no one sees a release that mise can't install yet.
+  draft: true
