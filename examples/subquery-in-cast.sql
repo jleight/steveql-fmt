@@ -7,9 +7,9 @@ SELECT   c.id       AS  id
         ,COALESCE(
              (
                 SELECT  ARRAY_AGG(t.name ORDER BY t.name)
-                FROM    customer_tags   ct
-                JOIN    tags            t   ON  t.id = ct.tag_id
-                                            AND t.archived_at IS NULL
+                FROM        customer_tags   ct
+                INNER JOIN  tags            t   ON  t.id = ct.tag_id
+                                                AND t.archived_at IS NULL
                 WHERE   ct.customer_id = c.id
              )
             ,'{}'

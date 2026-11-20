@@ -8,8 +8,8 @@ WITH RECURSIVE descendants AS (
 
         SELECT   c.id
                 ,c.parent_id
-        FROM    categories  c
-        JOIN    descendants d   ON  c.parent_id = d.id
+        FROM        categories  c
+        INNER JOIN  descendants d   ON  c.parent_id = d.id
     )
     ,counts AS (
         SELECT   parent_id  AS  parent_id

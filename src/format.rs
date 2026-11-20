@@ -1035,7 +1035,7 @@ impl Fmt {
 
     fn join_parts(&self, join: &Join) -> (String, Option<OnClause>) {
         let (kw, constraint) = match &join.join_operator {
-            JoinOperator::Join(c) | JoinOperator::Inner(c) => ("JOIN", Some(c)),
+            JoinOperator::Join(c) | JoinOperator::Inner(c) => ("INNER JOIN", Some(c)),
             JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => ("LEFT JOIN", Some(c)),
             JoinOperator::Right(c) | JoinOperator::RightOuter(c) => ("RIGHT JOIN", Some(c)),
             JoinOperator::FullOuter(c) => ("FULL JOIN", Some(c)),

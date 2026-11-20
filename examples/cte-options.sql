@@ -12,8 +12,8 @@ WITH recent AS MATERIALIZED (
     )
 SELECT   c.name
         ,t.n
-FROM    totals      t
-JOIN    customers   c   ON  c.id = t.customer_id;
+FROM        totals      t
+INNER JOIN  customers   c   ON  c.id = t.customer_id;
 
 WITH RECURSIVE tree (id, parent_id, depth) AS (
         SELECT   id
@@ -27,8 +27,8 @@ WITH RECURSIVE tree (id, parent_id, depth) AS (
         SELECT   c.id
                 ,c.parent_id
                 ,t.depth + 1
-        FROM    categories  c
-        JOIN    tree        t   ON  c.parent_id = t.id
+        FROM        categories  c
+        INNER JOIN  tree        t   ON  c.parent_id = t.id
     )
 SELECT   id
         ,depth

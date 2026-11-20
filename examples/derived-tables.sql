@@ -8,7 +8,7 @@ FROM
     WHERE   amount > 0
     GROUP BY region
 )   t
-JOIN
+INNER JOIN
 (
     SELECT   region     AS  region
             ,COUNT(*)   AS  n

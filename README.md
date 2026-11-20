@@ -133,13 +133,13 @@ least one space — `ceil4(prev_field_last_col + 2)`. Values flow in a vertical
 WITH RECURSIVE roots AS (
         SELECT   c.oid
                 ,n.nspname
-        FROM    pg_class        c
-        JOIN    pg_namespace    n   ON  n.oid = c.relnamespace
+        FROM        pg_class        c
+        INNER JOIN  pg_namespace    n   ON  n.oid = c.relnamespace
         WHERE   c.relkind IN ('r', 'p')
                 AND NOT c.relispartition
     )
 SELECT   r.nspname
-        ,COUNT(*)   AS n
+        ,COUNT(*)   AS  n
 FROM    roots   r
 ORDER BY 1, 2
 ```
@@ -152,8 +152,10 @@ ORDER BY 1, 2
   align on the same grid — their value "ends" at the closing `)` (or `END`).
 - **FROM and its JOINs** form one alignment group: table names, aliases, `ON`,
   and the join condition each get their own grid column; trailing `AND`/`OR`
-  align under `ON`. `LEFT JOIN` (etc.) widens the group, pushing tables out, and
-  so does `LATERAL`, which joins the keyword (`CROSS JOIN LATERAL`).
+  align under `ON`. A bare `JOIN` is always written as `INNER JOIN`, so it's
+  clear which kind it is. A join keyword wider than `FROM` (`INNER JOIN`,
+  `LEFT JOIN`, etc.) widens the group, pushing tables out, and so does
+  `LATERAL`, which joins the keyword (`CROSS JOIN LATERAL`).
   Comma-separated tables take leading commas like a SELECT list. `TABLESAMPLE`
   follows the alias on the next tabstop, or takes its column when there's none.
 - **WHERE / HAVING** put the keyword in the gutter and flow predicates in the

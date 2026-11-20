@@ -24,8 +24,8 @@ LEFT JOIN LATERAL
 SELECT   id
         ,name
         ,region
-FROM            stores
-NATURAL JOIN    store_regions;
+FROM                stores
+NATURAL INNER JOIN  store_regions;
 
 SELECT   v.code
         ,v.label
@@ -34,5 +34,5 @@ FROM
     VALUES
          ('a', 'Alpha')
         ,('b', 'Beta')
-)               v (code, label)
-JOIN    codes   c (code, active)    ON  c.code = v.code
+)                   v (code, label)
+INNER JOIN  codes   c (code, active)    ON  c.code = v.code
