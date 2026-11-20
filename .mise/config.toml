@@ -1,5 +1,5 @@
 [tools]
-rust = "latest"
+rust = { version = "latest", components = "rustfmt,clippy" }
 goreleaser = "latest"
 zig = "latest"
 "github:rust-cross/cargo-zigbuild" = "latest"
