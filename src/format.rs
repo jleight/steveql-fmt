@@ -10,9 +10,9 @@ use crate::funcs;
 
 mod ddl;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Cte, Delete, Distinct, Expr,
-    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, InTarget, Insert,
-    Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, Cte, Delete, Distinct,
+    Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, InTarget,
+    Insert, Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
     MergeInsertKind, MergeUpdateKind, NamedWindowDefinition, NamedWindowExpr, OnConflictAction,
     OnInsert, OrderBy, OrderByExpr, OrderByKind, OutputClause, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, Spanned, Statement, TableAlias, TableFactor, TableObject,
@@ -545,6 +545,34 @@ impl Fmt {
                 Some(wrap(head, Split::bare(Block::Query(subquery)), ""))
             }
             Expr::Case { .. } => Some(Split::bare(Block::Case(e))),
+            // `x::T` puts the type after the block's close; `CAST(x AS T)`
+            // wraps it like a call with a lone argument.
+            Expr::Cast {
+                kind,
+                expr,
+                data_type,
+                format,
+            } => {
+                let inner = self.split(expr)?;
+                let open = match kind {
+                    CastKind::DoubleColon => {
+                        return Some(wrap(
+                            String::new(),
+                            inner,
+                            &self.post(&format!("::{data_type}")),
+                        ))
+                    }
+                    CastKind::Cast => "CAST(",
+                    CastKind::TryCast => "TRY_CAST(",
+                    CastKind::SafeCast => "SAFE_CAST(",
+                };
+                let mut tail = format!(" AS {data_type}");
+                if let Some(format) = format {
+                    tail.push_str(&format!(" FORMAT {format}"));
+                }
+                tail.push(')');
+                Some(wrap(open.to_string(), inner, &self.post(&tail)))
+            }
             Expr::Function(f) => {
                 if let Some(WindowType::WindowSpec(spec)) = &f.over {
                     if !expands(spec) {
