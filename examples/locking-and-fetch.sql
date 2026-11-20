@@ -12,6 +12,16 @@ FROM    jobs.queue
 WHERE   id = %(id)s
 FOR UPDATE OF queue NOWAIT;
 
+SELECT  id
+FROM    jobs.queue
+WHERE   id = %(id)s
+FOR NO KEY UPDATE;
+
+SELECT  id
+FROM    accounts
+WHERE   tier = 'gold'
+FOR KEY SHARE OF accounts SKIP LOCKED;
+
 SELECT   id
         ,score
 FROM    leaderboard

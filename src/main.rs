@@ -17,7 +17,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use format::Comment;
-use scan::{scan_not_equals, split_statements, swap_placeholders};
+use scan::{scan_not_equals, split_statements, swap_lock_strengths, swap_placeholders};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -172,11 +172,12 @@ pub(crate) fn format_sql(input: &str) -> (String, Option<String>) {
 /// change what it means, why (the chunk is then passed through verbatim).
 fn format_statement(chunk: &str) -> (String, Option<String>) {
     let trimmed = chunk.trim();
-    let (prepared, placeholders) = swap_placeholders(trimmed);
+    let (prepared, placeholders, keyed_locks) = prepare(trimmed);
 
     match Parser::parse_sql(&PostgreSqlDialect {}, &prepared) {
         Ok(statements) if !statements.is_empty() => {
-            let fmt = format::Fmt::new(placeholders, collect_comments(trimmed));
+            let fmt =
+                format::Fmt::new(placeholders, collect_comments(trimmed), keyed_locks.clone());
             let body = statements
                 .iter()
                 .map(|s| fmt.statement(s))
@@ -187,7 +188,7 @@ fn format_statement(chunk: &str) -> (String, Option<String>) {
             // The layout is rebuilt from the parts of the AST the formatter
             // knows about, so anything it doesn't know would vanish. Re-parse
             // the result and refuse it unless it says the same thing.
-            if !same_meaning(statements, &formatted) {
+            if !same_meaning(statements, &keyed_locks, &formatted) {
                 return (
                     trimmed.to_string(),
                     Some("formatting it would have changed what it means".to_string()),
@@ -201,12 +202,22 @@ fn format_statement(chunk: &str) -> (String, Option<String>) {
     }
 }
 
-/// Whether `formatted` parses to the same statements as `original`, ignoring
-/// the differences the style introduces on purpose.
-fn same_meaning(original: Vec<Statement>, formatted: &str) -> bool {
-    let (prepared, _) = swap_placeholders(formatted);
+/// Rewrite what sqlparser can't parse into what it can: placeholders into
+/// sentinels, and `KEY` lock strengths into plain ones. Returns the SQL, the
+/// original placeholders, and which lock clauses had a `KEY` strength.
+fn prepare(src: &str) -> (String, Vec<String>, Vec<bool>) {
+    let (swapped, placeholders) = swap_placeholders(src);
+    let (prepared, keyed_locks) = swap_lock_strengths(&swapped);
+    (prepared, placeholders, keyed_locks)
+}
+
+/// Whether `formatted` parses to the same statements as `original` (whose
+/// lock clauses had the `KEY` strengths in `keyed_locks`), ignoring the
+/// differences the style introduces on purpose.
+fn same_meaning(original: Vec<Statement>, keyed_locks: &[bool], formatted: &str) -> bool {
+    let (prepared, _, reparsed_locks) = prepare(formatted);
     match Parser::parse_sql(&PostgreSqlDialect {}, &prepared) {
-        Ok(reparsed) => canonical(original) == canonical(reparsed),
+        Ok(reparsed) => keyed_locks == reparsed_locks && canonical(original) == canonical(reparsed),
         Err(_) => false,
     }
 }

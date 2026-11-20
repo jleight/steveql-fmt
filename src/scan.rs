@@ -212,8 +212,9 @@ pub fn scan_not_equals(src: &str) -> Vec<bool> {
 }
 
 /// Replace psycopg-style placeholders (`%s`, `%(name)s`) and sqlc/SQLMesh-style
-/// ones (`@name`) with sqlparser-safe `$`-placeholders, returning the rewritten SQL and the originals (indexed by
-/// sentinel number). String literals and comments are left untouched.
+/// ones (`@name`) with sqlparser-safe `$`-placeholders, returning the rewritten
+/// SQL and the originals (indexed by sentinel number). String literals and
+/// comments are left untouched.
 pub fn swap_placeholders(src: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(src.len());
     let mut originals = Vec::new();
@@ -264,6 +265,78 @@ pub fn swap_placeholders(src: &str) -> (String, Vec<String>) {
     }
 
     (out, originals)
+}
+
+/// Rewrite Postgres's `FOR NO KEY UPDATE` and `FOR KEY SHARE` locks, which
+/// sqlparser can't parse, to `FOR UPDATE` and `FOR SHARE`. Returns the
+/// rewritten SQL and, for every lock clause in order, whether it was one of
+/// the `KEY` forms. String literals and comments are left untouched.
+pub fn swap_lock_strengths(src: &str) -> (String, Vec<bool>) {
+    let mut out = String::with_capacity(src.len());
+    let mut keyed = Vec::new();
+
+    for chunk in Scanner::new(src) {
+        if chunk.kind != ChunkKind::Code {
+            out.push_str(chunk.text);
+            continue;
+        }
+        let text = chunk.text;
+        let words = words(text);
+        let mut copied = 0;
+        for (i, &(start, end)) in words.iter().enumerate() {
+            if !text[start..end].eq_ignore_ascii_case("FOR") {
+                continue;
+            }
+            // The words after `FOR`, as long as only whitespace separates them.
+            let mut prev = end;
+            let next: Vec<(usize, usize, &str)> = words[i + 1..]
+                .iter()
+                .take(3)
+                .take_while(|&&(s, e)| {
+                    let gap = text[prev..s].trim().is_empty();
+                    prev = e;
+                    gap
+                })
+                .map(|&(s, e)| (s, e, &text[s..e]))
+                .collect();
+            let is = |j: usize, w: &str| next.get(j).is_some_and(|n| n.2.eq_ignore_ascii_case(w));
+            if is(0, "NO") && is(1, "KEY") && is(2, "UPDATE") {
+                out.push_str(&text[copied..next[0].0]);
+                copied = next[2].0;
+                keyed.push(true);
+            } else if is(0, "KEY") && is(1, "SHARE") {
+                out.push_str(&text[copied..next[0].0]);
+                copied = next[1].0;
+                keyed.push(true);
+            } else if is(0, "UPDATE") || is(0, "SHARE") {
+                keyed.push(false);
+            }
+        }
+        out.push_str(&text[copied..]);
+    }
+
+    (out, keyed)
+}
+
+/// The byte ranges of the words (runs of ASCII letters, digits, `_` and `$`)
+/// in `text`.
+fn words(text: &str) -> Vec<(usize, usize)> {
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < b.len() {
+        if is_word(b[k]) {
+            let start = k;
+            while k < b.len() && is_word(b[k]) {
+                k += 1;
+            }
+            out.push((start, k));
+        } else {
+            k += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -420,6 +493,18 @@ mod tests {
         let (out, originals) = swap_placeholders("a % 2");
         assert_eq!(out, "a % 2");
         assert!(originals.is_empty());
+    }
+
+    #[test]
+    fn lock_strengths_swap_key_forms() {
+        let (out, keyed) = swap_lock_strengths(
+            "for update; FOR NO KEY UPDATE OF t; for  key\nshare; for share; 'for key share'",
+        );
+        assert_eq!(
+            out,
+            "for update; FOR UPDATE OF t; for  share; for share; 'for key share'"
+        );
+        assert_eq!(keyed, vec![false, true, true, false]);
     }
 
     #[test]

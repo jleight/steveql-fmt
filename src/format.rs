@@ -36,14 +36,21 @@ pub struct Fmt {
     /// Comments sorted by source position, consumed via `cursor`.
     comments: Vec<Comment>,
     cursor: Cell<usize>,
+    /// For each lock clause in source order, whether it was `FOR NO KEY
+    /// UPDATE` / `FOR KEY SHARE` (see `swap_lock_strengths`), consumed via
+    /// `lock_cursor`.
+    keyed_locks: Vec<bool>,
+    lock_cursor: Cell<usize>,
 }
 
 impl Fmt {
-    pub fn new(placeholders: Vec<String>, comments: Vec<Comment>) -> Self {
+    pub fn new(placeholders: Vec<String>, comments: Vec<Comment>, keyed_locks: Vec<bool>) -> Self {
         Fmt {
             placeholders,
             comments,
             cursor: Cell::new(0),
+            keyed_locks,
+            lock_cursor: Cell::new(0),
         }
     }
 
@@ -175,7 +182,15 @@ impl Fmt {
             out.push(format!("{}{}", pad(ci), self.post(&fetch.to_string())));
         }
         for lock in &q.locks {
-            out.push(format!("{}{}", pad(ci), self.post(&lock.to_string())));
+            let mut text = self.post(&lock.to_string());
+            let i = self.lock_cursor.get();
+            self.lock_cursor.set(i + 1);
+            if self.keyed_locks.get(i) == Some(&true) {
+                text = text
+                    .replacen("FOR UPDATE", "FOR NO KEY UPDATE", 1)
+                    .replacen("FOR SHARE", "FOR KEY SHARE", 1);
+            }
+            out.push(format!("{}{text}", pad(ci)));
         }
 
         out
