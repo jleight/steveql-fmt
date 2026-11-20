@@ -560,6 +560,7 @@ impl Fmt {
                 Some(wrap(head, Split::bare(Block::Query(subquery)), ""))
             }
             Expr::Case { .. } => Some(Split::bare(Block::Case(e))),
+            Expr::Nested(_) => Some(Split::bare(Block::Chain(expanding_chain(e)?))),
             // `x::T` puts the type after the block's close; `CAST(x AS T)`
             // wraps it like a call with a lone argument.
             Expr::Cast {
@@ -597,6 +598,16 @@ impl Fmt {
                     bare.over = None;
                     let head = format!("{} OVER ", self.inline(&Expr::Function(bare)));
                     return Some(wrap(head, Split::bare(Block::Window(spec)), ""));
+                }
+                // `FILTER (WHERE ...)` expands like `OVER (...)` when its
+                // condition is an AND/OR chain; one condition stays inline.
+                if let Some(cond) = &f.filter {
+                    if f.over.is_none() && bool_chain(cond).1.len() > 1 {
+                        let mut bare = f.clone();
+                        bare.filter = None;
+                        let head = format!("{} FILTER ", self.inline(&Expr::Function(bare)));
+                        return Some(wrap(head, Split::bare(Block::Filter(cond)), ""));
+                    }
                 }
                 // A lone argument holding a block wraps it (`SUM(CASE`). With
                 // several, the call becomes the block: one argument per line.
@@ -732,6 +743,16 @@ impl Fmt {
             Block::Case(e) => {
                 out.push(std::mem::take(line));
                 self.case_body(e, body_ci, out);
+            }
+            Block::Filter(cond) => {
+                line.push('(');
+                out.push(std::mem::take(line));
+                out.extend(self.river("WHERE", cond, body_ci));
+            }
+            Block::Chain(chain) => {
+                line.push('(');
+                out.push(std::mem::take(line));
+                out.extend(self.river_lines(chain, body_ci));
             }
         }
         let mut close = pad(content_col);
@@ -1124,10 +1145,11 @@ impl Fmt {
         }
     }
 
-    /// Render a boolean chain as river lines starting at `river_col` (no leading
-    /// keyword). Used for the body of a parenthesized sub-river.
+    /// Render a boolean or arithmetic chain as river lines starting at
+    /// `river_col` (no leading keyword). Used for the body of a parenthesized
+    /// sub-river.
     fn river_lines(&self, expr: &Expr, river_col: usize) -> Vec<String> {
-        let (ops, operands) = bool_chain(expr);
+        let (ops, operands) = chain(expr);
         let mut out = Vec::new();
         self.emit_operand(operands[0], pad(river_col), river_col, river_col, &mut out);
         for (op, operand) in ops.iter().zip(operands.iter().skip(1)) {
@@ -1685,13 +1707,21 @@ enum Block<'e> {
     Case(&'e Expr),
     /// The arguments of a call, one per line.
     Args(&'e [FunctionArg]),
+    /// The condition of an aggregate's `FILTER (WHERE ...)`.
+    Filter(&'e Expr),
+    /// A parenthesized arithmetic chain, one operand per line.
+    Chain(&'e Expr),
 }
 
 impl Block<'_> {
     /// The text that ends the block on its closing line.
     fn close(&self) -> &'static str {
         match self {
-            Block::Query(_) | Block::Window(_) | Block::Args(_) => ")",
+            Block::Query(_)
+            | Block::Window(_)
+            | Block::Args(_)
+            | Block::Filter(_)
+            | Block::Chain(_) => ")",
             Block::Case(_) => "END",
         }
     }
@@ -2030,6 +2060,67 @@ fn nested_bool(e: &Expr) -> Option<&Expr> {
         }
     }
     None
+}
+
+/// The precedence level of an arithmetic operator: operators on one level
+/// chain together, as in `a + b - c`.
+fn arith_level(op: &BinaryOperator) -> Option<u8> {
+    match op {
+        BinaryOperator::Plus | BinaryOperator::Minus => Some(0),
+        BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => Some(1),
+        BinaryOperator::StringConcat => Some(2),
+        _ => None,
+    }
+}
+
+/// Flatten the top-level chain of one arithmetic precedence level, like
+/// `bool_chain` does for AND/OR. A single operand isn't a chain.
+fn arith_chain(e: &Expr) -> Option<(Vec<String>, Vec<&Expr>)> {
+    fn collect<'e>(e: &'e Expr, level: u8, ops: &mut Vec<String>, out: &mut Vec<&'e Expr>) {
+        if let Expr::BinaryOp { left, op, right } = e {
+            if arith_level(op) == Some(level) {
+                collect(left, level, ops, out);
+                ops.push(op.to_string());
+                collect(right, level, ops, out);
+                return;
+            }
+        }
+        out.push(e);
+    }
+    let Expr::BinaryOp { op, .. } = e else {
+        return None;
+    };
+    let level = arith_level(op)?;
+    let (mut ops, mut operands) = (Vec::new(), Vec::new());
+    collect(e, level, &mut ops, &mut operands);
+    Some((ops, operands))
+}
+
+/// The chain inside a parenthesized boolean or arithmetic expression, as
+/// operators and operands, for a sub-river.
+fn chain(e: &Expr) -> (Vec<String>, Vec<&Expr>) {
+    arith_chain(e).unwrap_or_else(|| {
+        let (ops, operands) = bool_chain(e);
+        (ops.into_iter().map(String::from).collect(), operands)
+    })
+}
+
+/// If `e` is a parenthesized arithmetic chain worth expanding, return the
+/// chain: three or more operands, at least one of them compound (a call, a
+/// cast, a `CASE`, or another parenthesized expression). A chain of plain
+/// columns stays inline however long it is.
+fn expanding_chain(e: &Expr) -> Option<&Expr> {
+    let Expr::Nested(inner) = e else {
+        return None;
+    };
+    let (_, operands) = arith_chain(inner)?;
+    let compound = |o: &&Expr| {
+        matches!(
+            o,
+            Expr::Function(_) | Expr::Cast { .. } | Expr::Case { .. } | Expr::Nested(_)
+        )
+    };
+    (operands.len() >= 3 && operands.iter().any(compound)).then_some(inner.as_ref())
 }
 
 fn collect_chain<'e>(e: &'e Expr, target: &BinaryOperator, out: &mut Vec<&'e Expr>) {
