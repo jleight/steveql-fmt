@@ -11,8 +11,8 @@ use crate::funcs;
 mod ddl;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ConflictTarget, Cte, Delete, Distinct, Expr,
-    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert, Join,
-    JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
+    FromTable, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, InTarget, Insert,
+    Join, JoinConstraint, JoinOperator, Merge, MergeAction, MergeClause, MergeClauseKind,
     MergeInsertKind, MergeUpdateKind, NamedWindowDefinition, NamedWindowExpr, OnConflictAction,
     OnInsert, OrderBy, OrderByExpr, OrderByKind, OutputClause, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, Spanned, Statement, TableAlias, TableFactor, TableObject,
@@ -533,13 +533,15 @@ impl Fmt {
                     "",
                 ))
             }
-            Expr::InSubquery {
+            Expr::In {
                 expr,
-                subquery,
+                target: InTarget::Subquery(subquery),
                 negated,
+                global,
             } if !is_short(subquery) => {
                 let not = if *negated { "NOT " } else { "" };
-                let head = format!("{} {not}IN ", self.inline(expr));
+                let global = if *global { "GLOBAL " } else { "" };
+                let head = format!("{} {global}{not}IN ", self.inline(expr));
                 Some(wrap(head, Split::bare(Block::Query(subquery)), ""))
             }
             Expr::Case { .. } => Some(Split::bare(Block::Case(e))),
@@ -1450,9 +1452,12 @@ impl Fmt {
             Some(OnInsert::OnConflict(oc)) => {
                 let mut head = format!("{}ON CONFLICT", pad(ci));
                 match &oc.conflict_target {
-                    Some(ConflictTarget::Columns(cols)) => {
-                        let list: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+                    Some(ConflictTarget::Columns { columns, predicate }) => {
+                        let list: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
                         head.push_str(&format!(" ({})", list.join(", ")));
+                        if let Some(p) = predicate {
+                            head.push_str(&format!(" WHERE {}", self.inline(p)));
+                        }
                     }
                     Some(other) => {
                         head.push(' ');

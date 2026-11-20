@@ -9,7 +9,8 @@
 //! small consumer that only inspects [`ChunkKind::Code`] regions.
 
 /// The placeholder sentinel `swap_placeholders` substitutes for psycopg-style
-/// `%s` / `%(name)s` markers so sqlparser can parse the statement.
+/// `%s` / `%(name)s` and sqlc-style `@name` markers so sqlparser can parse the
+/// statement.
 pub const SENTINEL_PREFIX: &str = "$sqlfmtph";
 
 /// What a [`Chunk`] of source is.
@@ -210,8 +211,8 @@ pub fn scan_not_equals(src: &str) -> Vec<bool> {
     out
 }
 
-/// Replace psycopg-style placeholders (`%s`, `%(name)s`) with sqlparser-safe
-/// `$`-placeholders, returning the rewritten SQL and the originals (indexed by
+/// Replace psycopg-style placeholders (`%s`, `%(name)s`) and sqlc/SQLMesh-style
+/// ones (`@name`) with sqlparser-safe `$`-placeholders, returning the rewritten SQL and the originals (indexed by
 /// sentinel number). String literals and comments are left untouched.
 pub fn swap_placeholders(src: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(src.len());
@@ -226,10 +227,17 @@ pub fn swap_placeholders(src: &str) -> (String, Vec<String>) {
         let mut k = 0;
         let mut copied = 0; // bytes of this chunk already flushed to `out`
         while k < b.len() {
-            // Placeholder: % followed by a letter or '('.
-            if b[k] == b'%'
-                && matches!(b.get(k + 1), Some(&n) if n.is_ascii_alphabetic() || n == b'(')
-            {
+            // `%` followed by a letter or '('.
+            let percent = b[k] == b'%'
+                && matches!(b.get(k + 1), Some(&n) if n.is_ascii_alphabetic() || n == b'(');
+            // `@name`, but not `@@name` or the `@` in `a@b`. Otherwise Postgres
+            // reads it as the `@` (absolute value) operator, which sqlparser
+            // prints with a space after it.
+            let at = b[k] == b'@'
+                && matches!(b.get(k + 1), Some(&n) if n.is_ascii_alphabetic() || n == b'_')
+                && !(k > 0
+                    && (b[k - 1].is_ascii_alphanumeric() || matches!(b[k - 1], b'_' | b'@')));
+            if percent || at {
                 out.push_str(&chunk.text[copied..k]);
                 let pstart = k;
                 k += 1;
@@ -412,5 +420,12 @@ mod tests {
         let (out, originals) = swap_placeholders("a % 2");
         assert_eq!(out, "a % 2");
         assert!(originals.is_empty());
+    }
+
+    #[test]
+    fn placeholders_swap_at_names() {
+        let (out, originals) = swap_placeholders("a = @owner_id and b = @@x and c = d@e");
+        assert_eq!(out, "a = $sqlfmtph0 and b = @@x and c = d@e");
+        assert_eq!(originals, vec!["@owner_id".to_string()]);
     }
 }
